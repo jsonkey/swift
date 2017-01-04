@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# Copyright (c) 2010-2012 OpenStack, LLC.
+# Copyright (c) 2010-2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,16 +14,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import print_function
 import os
 import sys
-from urllib import quote
 from hashlib import md5
 import getopt
 from itertools import chain
 
-import simplejson
+import json
 from eventlet.greenpool import GreenPool
 from eventlet.event import Event
+from six.moves.urllib.parse import quote
 
 from swift.common.ring import Ring
 from swift.common.utils import split_path
@@ -53,12 +54,11 @@ Examples!
 
 class Auditor(object):
     def __init__(self, swift_dir='/etc/swift', concurrency=50, deep=False,
-                    error_file=None):
+                 error_file=None):
         self.pool = GreenPool(concurrency)
-        self.object_ring = Ring(os.path.join(swift_dir, ring_name='object'))
-        self.container_ring = \
-            Ring(os.path.join(swift_dir, ring_name='container'))
-        self.account_ring = Ring(os.path.join(swift_dir, ring_name='account'))
+        self.object_ring = Ring(swift_dir, ring_name='object')
+        self.container_ring = Ring(swift_dir, ring_name='container')
+        self.account_ring = Ring(swift_dir, ring_name='account')
         self.deep = deep
         self.error_file = error_file
         # zero out stats
@@ -79,7 +79,7 @@ class Auditor(object):
         container_listing = self.audit_container(account, container)
         consistent = True
         if name not in container_listing:
-            print "  Object %s missing in container listing!" % path
+            print("  Object %s missing in container listing!" % path)
             consistent = False
             hash = None
         else:
@@ -89,7 +89,7 @@ class Auditor(object):
             try:
                 if self.deep:
                     conn = http_connect(node['ip'], node['port'],
-                            node['device'], part, 'GET', path, {})
+                                        node['device'], part, 'GET', path, {})
                     resp = conn.getresponse()
                     calc_hash = md5()
                     chunk = True
@@ -100,14 +100,14 @@ class Auditor(object):
                     if resp.status // 100 != 2:
                         self.object_not_found += 1
                         consistent = False
-                        print '  Bad status GETting object "%s" on %s/%s' \
-                                        % (path, node['ip'], node['device'])
+                        print('  Bad status GETting object "%s" on %s/%s'
+                              % (path, node['ip'], node['device']))
                         continue
                     if resp.getheader('ETag').strip('"') != calc_hash:
                         self.object_checksum_mismatch += 1
                         consistent = False
-                        print '  MD5 doesnt match etag for "%s" on %s/%s' \
-                                        % (path, node['ip'], node['device'])
+                        print('  MD5 does not match etag for "%s" on %s/%s'
+                              % (path, node['ip'], node['device']))
                     etags.append(resp.getheader('ETag'))
                 else:
                     conn = http_connect(node['ip'], node['port'],
@@ -117,28 +117,29 @@ class Auditor(object):
                     if resp.status // 100 != 2:
                         self.object_not_found += 1
                         consistent = False
-                        print '  Bad status HEADing object "%s" on %s/%s' \
-                                        % (path, node['ip'], node['device'])
+                        print('  Bad status HEADing object "%s" on %s/%s'
+                              % (path, node['ip'], node['device']))
                         continue
                     etags.append(resp.getheader('ETag'))
             except Exception:
                 self.object_exceptions += 1
                 consistent = False
-                print '  Exception fetching object "%s" on %s/%s' \
-                                % (path, node['ip'], node['device'])
+                print('  Exception fetching object "%s" on %s/%s'
+                      % (path, node['ip'], node['device']))
                 continue
         if not etags:
             consistent = False
-            print "  Failed fo fetch object %s at all!" % path
+            print("  Failed fo fetch object %s at all!" % path)
         elif hash:
             for etag in etags:
                 if resp.getheader('ETag').strip('"') != hash:
                     consistent = False
                     self.object_checksum_mismatch += 1
-                    print '  ETag mismatch for "%s" on %s/%s' \
-                                    % (path, node['ip'], node['device'])
+                    print('  ETag mismatch for "%s" on %s/%s'
+                          % (path, node['ip'], node['device']))
         if not consistent and self.error_file:
-            print >>open(self.error_file, 'a'), path
+            with open(self.error_file, 'a') as err_file:
+                print(path, file=err_file)
         self.objects_checked += 1
 
     def audit_container(self, account, name, recurse=False):
@@ -147,13 +148,13 @@ class Auditor(object):
         if (account, name) in self.list_cache:
             return self.list_cache[(account, name)]
         self.in_progress[(account, name)] = Event()
-        print 'Auditing container "%s"' % name
+        print('Auditing container "%s"' % name)
         path = '/%s/%s' % (account, name)
         account_listing = self.audit_account(account)
         consistent = True
         if name not in account_listing:
             consistent = False
-            print "  Container %s not in account listing!" % path
+            print("  Container %s not in account listing!" % path)
         part, nodes = \
             self.container_ring.get_nodes(account, name.encode('utf-8'))
         rec_d = {}
@@ -162,7 +163,6 @@ class Auditor(object):
             marker = ''
             results = True
             while results:
-                node_id = node['id']
                 try:
                     conn = http_connect(node['ip'], node['port'],
                                         node['device'], part, 'GET',
@@ -178,12 +178,12 @@ class Auditor(object):
                         break
                     if node['id'] not in responses:
                         responses[node['id']] = dict(resp.getheaders())
-                    results = simplejson.loads(resp.read())
+                    results = json.loads(resp.read())
                 except Exception:
                     self.container_exceptions += 1
                     consistent = False
-                    print '  Exception GETting container "%s" on %s/%s' % \
-                                (path, node['ip'], node['device'])
+                    print('  Exception GETting container "%s" on %s/%s' %
+                          (path, node['ip'], node['device']))
                     break
                 if results:
                     marker = results[-1]['name']
@@ -196,22 +196,23 @@ class Auditor(object):
                             self.container_obj_mismatch += 1
                             consistent = False
                             print("  Different versions of %s/%s "
-                                  "in container dbs." % \
-                                      (name, obj['name']))
+                                  "in container dbs." % (name, obj['name']))
                             if (obj['last_modified'] >
                                     rec_d[obj_name]['last_modified']):
                                 rec_d[obj_name] = obj
         obj_counts = [int(header['x-container-object-count'])
-                             for header in responses.values()]
+                      for header in responses.values()]
         if not obj_counts:
             consistent = False
-            print "  Failed to fetch container %s at all!" % path
+            print("  Failed to fetch container %s at all!" % path)
         else:
             if len(set(obj_counts)) != 1:
                 self.container_count_mismatch += 1
                 consistent = False
-                print "  Container databases don't agree on number of objects."
-                print "  Max: %s, Min: %s" % (max(obj_counts), min(obj_counts))
+                print(
+                    "  Container databases don't agree on number of objects.")
+                print(
+                    "  Max: %s, Min: %s" % (max(obj_counts), min(obj_counts)))
         self.containers_checked += 1
         self.list_cache[(account, name)] = rec_d
         self.in_progress[(account, name)].send(True)
@@ -220,7 +221,8 @@ class Auditor(object):
             for obj in rec_d.keys():
                 self.pool.spawn_n(self.audit_object, account, name, obj)
         if not consistent and self.error_file:
-            print >>open(self.error_file, 'a'), path
+            with open(self.error_file, 'a') as error_file:
+                print(path, file=error_file)
         return rec_d
 
     def audit_account(self, account, recurse=False):
@@ -229,7 +231,7 @@ class Auditor(object):
         if account in self.list_cache:
             return self.list_cache[account]
         self.in_progress[account] = Event()
-        print 'Auditing account "%s"' % account
+        print('Auditing account "%s"' % account)
         consistent = True
         path = '/%s' % account
         part, nodes = self.account_ring.get_nodes(account)
@@ -252,7 +254,7 @@ class Auditor(object):
                               " from %ss:%ss" %
                               (account, node['ip'], node['device']))
                         break
-                    results = simplejson.loads(resp.read())
+                    results = json.loads(resp.read())
                 except Exception:
                     self.account_exceptions += 1
                     consistent = False
@@ -264,27 +266,27 @@ class Auditor(object):
                 responses[node_id][1].extend(results)
                 if results:
                     marker = results[-1]['name']
-        headers = [resp[0] for resp in responses.values()]
+        headers = [r[0] for r in responses.values()]
         cont_counts = [int(header['x-account-container-count'])
-                             for header in headers]
+                       for header in headers]
         if len(set(cont_counts)) != 1:
             self.account_container_mismatch += 1
             consistent = False
             print("  Account databases for '%s' don't agree on"
                   " number of containers." % account)
             if cont_counts:
-                print "  Max: %s, Min: %s" % (max(cont_counts),
-                                              min(cont_counts))
+                print("  Max: %s, Min: %s" % (max(cont_counts),
+                                              min(cont_counts)))
         obj_counts = [int(header['x-account-object-count'])
-                             for header in headers]
+                      for header in headers]
         if len(set(obj_counts)) != 1:
             self.account_object_mismatch += 1
             consistent = False
             print("  Account databases for '%s' don't agree on"
                   " number of objects." % account)
             if obj_counts:
-                print "  Max: %s, Min: %s" % (max(obj_counts),
-                                              min(obj_counts))
+                print("  Max: %s, Min: %s" % (max(obj_counts),
+                                              min(obj_counts)))
         containers = set()
         for resp in responses.values():
             containers.update(container['name'] for container in resp[1])
@@ -297,7 +299,8 @@ class Auditor(object):
                 self.pool.spawn_n(self.audit_container, account,
                                   container, True)
         if not consistent and self.error_file:
-            print >>open(self.error_file, 'a'), path
+            with open(self.error_file, 'a') as error_file:
+                print(path, error_file)
         return containers
 
     def audit(self, account, container=None, obj=None):
@@ -312,45 +315,50 @@ class Auditor(object):
         self.pool.waitall()
 
     def print_stats(self):
-        print
-        print "  Accounts checked: %d" % self.accounts_checked
+
+        def _print_stat(name, stat):
+            # Right align stat name in a field of 18 characters
+            print("{0:>18}: {1}".format(name, stat))
+
+        print()
+        _print_stat("Accounts checked", self.accounts_checked)
         if self.account_not_found:
-            print "  Missing Replicas: %d" % self.account_not_found
+            _print_stat("Missing Replicas", self.account_not_found)
         if self.account_exceptions:
-            print "        Exceptions: %d" % self.account_exceptions
+            _print_stat("Exceptions", self.account_exceptions)
         if self.account_container_mismatch:
-            print " Cntainer mismatch: %d" % self.account_container_mismatch
+            _print_stat("Container mismatch", self.account_container_mismatch)
         if self.account_object_mismatch:
-            print "   Object mismatch: %d" % self.account_object_mismatch
-        print
-        print "Containers checked: %d" % self.containers_checked
+            _print_stat("Object mismatch", self.account_object_mismatch)
+        print()
+        _print_stat("Containers checked", self.containers_checked)
         if self.container_not_found:
-            print "  Missing Replicas: %d" % self.container_not_found
+            _print_stat("Missing Replicas", self.container_not_found)
         if self.container_exceptions:
-            print "        Exceptions: %d" % self.container_exceptions
+            _print_stat("Exceptions", self.container_exceptions)
         if self.container_count_mismatch:
-            print "    Count mismatch: %d" % self.container_count_mismatch
+            _print_stat("Count mismatch", self.container_count_mismatch)
         if self.container_obj_mismatch:
-            print "      Obj mismatch: %d" % self.container_obj_mismatch
-        print
-        print "   Objects checked: %d" % self.objects_checked
+            _print_stat("Object mismatch", self.container_obj_mismatch)
+        print()
+        _print_stat("Objects checked", self.objects_checked)
         if self.object_not_found:
-            print "  Missing Replicas: %d" % self.object_not_found
+            _print_stat("Missing Replicas", self.object_not_found)
         if self.object_exceptions:
-            print "        Exceptions: %d" % self.object_exceptions
+            _print_stat("Exceptions", self.object_exceptions)
         if self.object_checksum_mismatch:
-            print "      MD5 Mismatch: %d" % self.object_checksum_mismatch
+            _print_stat("MD5 Mismatch", self.object_checksum_mismatch)
 
 
 if __name__ == '__main__':
     try:
         optlist, args = getopt.getopt(sys.argv[1:], 'c:r:e:d')
-    except getopt.GetoptError, err:
-        print str(err)
-        print usage
+    except getopt.GetoptError as err:
+        print(str(err))
+        print(usage)
         sys.exit(2)
     if not args and os.isatty(sys.stdin.fileno()):
-        print usage
+        print(usage)
         sys.exit()
     opts = dict(optlist)
     options = {

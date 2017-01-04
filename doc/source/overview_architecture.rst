@@ -2,8 +2,6 @@
 Swift Architectural Overview
 ============================
 
-.. TODO - add links to more detailed overview in each section below.
-
 ------------
 Proxy Server
 ------------
@@ -11,7 +9,10 @@ Proxy Server
 The Proxy Server is responsible for tying together the rest of the Swift
 architecture. For each request, it will look up the location of the account,
 container, or object in the ring (see below) and route the request accordingly.
-The public API is also exposed through the Proxy Server.
+For Erasure Code type policies, the Proxy Server is also responsible for
+encoding and decoding object data.  See :doc:`overview_erasure_code` for
+complete information on Erasure Code support.  The public API is also exposed
+through the Proxy Server.
 
 A large number of failures are also handled in the Proxy Server. For
 example, if a server is unavailable for an object PUT, it will ask the
@@ -27,9 +28,9 @@ The Ring
 
 A ring represents a mapping between the names of entities stored on disk and
 their physical location. There are separate rings for accounts, containers, and
-objects. When other components need to perform any operation on an object,
-container, or account, they need to interact with the appropriate ring to
-determine its location in the cluster.
+one object ring per storage policy. When other components need to perform any
+operation on an object, container, or account, they need to interact with the
+appropriate ring to determine its location in the cluster.
 
 The Ring maintains this mapping using zones, devices, partitions, and replicas.
 Each partition in the ring is replicated, by default, 3 times across the
@@ -37,22 +38,71 @@ cluster, and the locations for a partition are stored in the mapping maintained
 by the ring. The ring is also responsible for determining which devices are
 used for handoff in failure scenarios.
 
-Data can be isolated with the concept of zones in the ring. Each replica
-of a partition is guaranteed to reside in a different zone. A zone could
-represent a drive, a server, a cabinet, a switch, or even a datacenter.
+The replicas of each partition will be isolated onto as many distinct regions,
+zones, servers and devices as the capacity of these failure domains allow.  If
+there are less failure domains at a given tier than replicas of the partition
+assigned within a tier (e.g. a 3 replica cluster with 2 servers), or the
+available capacity across the failure domains within a tier are not well
+balanced it will not be possible to achieve both even capacity distribution
+(`balance`) as well as complete isolation of replicas across failure domains
+(`dispersion`).  When this occurs the ring management tools will display a
+warning so that the operator can evaluate the cluster topology.
 
-The partitions of the ring are equally divided among all the devices in the
-Swift installation. When partitions need to be moved around (for example if a
-device is added to the cluster), the ring ensures that a minimum number of
-partitions are moved at a time, and only one replica of a partition is moved at
-a time.
+Data is evenly distributed across the capacity available in the cluster as
+described by the devices weight.  Weights can be used to balance the
+distribution of partitions on drives across the cluster. This can be useful,
+for example, when different sized drives are used in a cluster.  Device
+weights can also be used when adding or removing capacity or failure domains
+to control how many partitions are reassigned during a rebalance to be moved
+as soon as replication bandwidth allows.
 
-Weights can be used to balance the distribution of partitions on drives
-across the cluster. This can be useful, for example, when different sized
-drives are used in a cluster.
+.. note::
+    Prior to Swift 2.1.0 it was not possible to restrict partition movement by
+    device weight when adding new failure domains, and would allow extremely
+    unbalanced rings.  The greedy dispersion algorithm is now subject to the
+    constraints of the physical capacity in the system, but can be adjusted
+    with-in reason via the overload option.  Artificially unbalancing the
+    partition assignment without respect to capacity can introduce unexpected
+    full devices when a given failure domain does not physically support its
+    share of the used capacity in the tier.
+
+When partitions need to be moved around (for example if a device is added to
+the cluster), the ring ensures that a minimum number of partitions are moved
+at a time, and only one replica of a partition is moved at a time.
 
 The ring is used by the Proxy server and several background processes
-(like replication).
+(like replication). See :doc:`overview_ring` for complete information on the
+ring.
+
+----------------
+Storage Policies
+----------------
+
+Storage Policies provide a way for object storage providers to differentiate
+service levels, features and behaviors of a Swift deployment.  Each Storage
+Policy configured in Swift is exposed to the client via an abstract name.
+Each device in the system is assigned to one or more Storage Policies.  This
+is accomplished through the use of multiple object rings, where each Storage
+Policy has an independent object ring, which may include a subset of hardware
+implementing a particular differentiation.
+
+For example, one might have the default policy with 3x replication, and create
+a second policy which, when applied to new containers only uses 2x replication.
+Another might add SSDs to a set of storage nodes and create a performance tier
+storage policy for certain containers to have their objects stored there.  Yet
+another might be the use of Erasure Coding to define a cold-storage tier.
+
+This mapping is then exposed on a per-container basis, where each container
+can be assigned a specific storage policy when it is created, which remains in
+effect for the lifetime of the container.  Applications require minimal
+awareness of storage policies to use them; once a container has been created
+with a specific policy, all objects stored in it will be done so in accordance
+with that policy.
+
+The Storage Policies feature is implemented throughout the entire code base so
+it is an important concept in understanding Swift architecture.
+
+See :doc:`overview_policies` for complete information on storage policies.
 
 -------------
 Object Server
@@ -111,6 +161,17 @@ item (object, container, or account) is deleted, a tombstone is set as the
 latest version of the item. The replicator will see the tombstone and ensure
 that the item is removed from the entire system.
 
+See :doc:`overview_replication` for complete information on replication.
+
+--------------
+Reconstruction
+--------------
+
+The reconstructor is used by Erasure Code policies and is analogous to the
+replicator for Replication type policies.  See :doc:`overview_erasure_code`
+for complete information on both Erasure Code support as well as the
+reconstructor.
+
 --------
 Updaters
 --------
@@ -142,4 +203,3 @@ for example), the file is quarantined, and replication will replace the bad
 file from another replica. If other errors are found they are logged (for
 example, an object's listing can't be found on any container server it
 should be).
-

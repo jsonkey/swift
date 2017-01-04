@@ -1,13 +1,14 @@
 #!/bin/bash
 
-cd test/functional
-nosetests --exe $@
-func1=$?
+# How-To debug functional tests:
+# SWIFT_TEST_IN_PROCESS=1 tox -e func -- --pdb test.functional.tests.TestFile.testCopy
+
+SRC_DIR=$(python -c "import os; print os.path.dirname(os.path.realpath('$0'))")
+
+cd ${SRC_DIR}
+export TESTS_DIR=${SRC_DIR}/test/functional
+ostestr --serial --pretty $@
+rvalue=$?
 cd -
 
-cd test/functionalnosetests
-nosetests --exe $@
-func2=$?
-cd -
-
-exit $((func1 + func2))
+exit $rvalue

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# Copyright (c) 2010-2012 OpenStack, LLC.
+# Copyright (c) 2010-2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,9 +17,32 @@
 import sys
 from optparse import OptionParser
 
-from swift.common.manager import Server, Manager, UnknownCommandError
+from swift.common.manager import Manager, UnknownCommandError, \
+    KILL_WAIT, RUN_DIR
 
-USAGE = """%prog <server> [<server> ...] <command> [options]
+USAGE = \
+    """%prog <server>[.<config>] [<server>[.<config>] ...] <command> [options]
+
+where:
+    <server>  is the name of a swift service e.g. proxy-server.
+              The '-server' part of the name may be omitted.
+              'all', 'main' and 'rest' are reserved words that represent a
+              group of services.
+              all: Expands to all swift daemons.
+              main: Expands to main swift daemons.
+                    (proxy, container, account, object)
+              rest: Expands to all remaining background daemons (beyond
+                    "main").
+                    (updater, replicator, auditor, etc)
+    <config>  is an explicit configuration filename without the
+              .conf extension. If <config> is specified then <server> should
+              refer to a directory containing the configuration file, e.g.:
+
+                  swift-init object.1 start
+
+              will start an object-server using the configuration file
+              /etc/swift/object-server/1.conf
+    <command> is a command from the list below.
 
 Commands:
 """ + '\n'.join(["%16s: %s" % x for x in Manager.list_commands()])
@@ -42,11 +65,34 @@ def main():
     parser.add_option('-c', '--config-num', metavar="N", type="int",
                       dest="number", default=0,
                       help="send command to the Nth server only")
+    parser.add_option('-k', '--kill-wait', metavar="N", type="int",
+                      dest="kill_wait", default=KILL_WAIT,
+                      help="wait N seconds for processes to die (default 15)")
+    parser.add_option('-r', '--run-dir', type="str",
+                      dest="run_dir", default=RUN_DIR,
+                      help="alternative directory to store running pid files "
+                      "default: %s" % RUN_DIR)
+    # Changing behaviour if missing config
+    parser.add_option('--strict', dest='strict', action='store_true',
+                      help="Return non-zero status code if some config is "
+                           "missing. Default mode if all servers are "
+                           "explicitly named.")
+    # a negative option for strict
+    parser.add_option('--non-strict', dest='strict', action='store_false',
+                      help="Return zero status code even if some config is "
+                           "missing. Default mode if any server is a glob or "
+                           "one of aliases `all`, `main` or `rest`.")
+    # SIGKILL daemon after kill_wait period
+    parser.add_option('--kill-after-timeout', dest='kill_after_timeout',
+                      action='store_true',
+                      help="Kill daemon and all children after kill-wait "
+                           "period.")
+
     options, args = parser.parse_args()
 
     if len(args) < 2:
         parser.print_help()
-        print 'ERROR: specify server(s) and command'
+        print('ERROR: specify server(s) and command')
         return 1
 
     command = args[-1]
@@ -58,12 +104,12 @@ def main():
         servers.append(command)
         command = servers.pop(0)
 
-    manager = Manager(servers)
+    manager = Manager(servers, run_dir=options.run_dir)
     try:
         status = manager.run_command(command, **options.__dict__)
     except UnknownCommandError:
         parser.print_help()
-        print 'ERROR: unknown command, %s' % command
+        print('ERROR: unknown command, %s' % command)
         status = 1
 
     return 1 if status else 0

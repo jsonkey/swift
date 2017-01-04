@@ -1,4 +1,4 @@
-# Copyright (c) 2011 OpenStack, LLC.
+# Copyright (c) 2011-2014 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,23 +13,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from time import gmtime, strftime, time
+from __future__ import print_function
+
+from time import time
 from traceback import format_exc
-from urllib import quote, unquote
 from uuid import uuid4
 from hashlib import sha1
 import hmac
 import base64
 
 from eventlet import Timeout
+import six
+from six.moves.urllib.parse import unquote
 from swift.common.swob import Response, Request
 from swift.common.swob import HTTPBadRequest, HTTPForbidden, HTTPNotFound, \
     HTTPUnauthorized
 
-from swift.common.middleware.acl import clean_acl, parse_acl, referrer_allowed
-from swift.common.utils import cache_from_env, get_logger, get_remote_client, \
-    split_path, config_true_value
-from swift.common.http import HTTP_CLIENT_CLOSED_REQUEST
+from swift.common.request_helpers import get_sys_meta_prefix
+from swift.common.middleware.acl import (
+    clean_acl, parse_acl, referrer_allowed, acls_from_account_info)
+from swift.common.utils import cache_from_env, get_logger, \
+    split_path, config_true_value, register_swift_info
+from swift.common.utils import config_read_reseller_options
+from swift.proxy.controllers.base import get_account_info
+
+
+DEFAULT_TOKEN_LIFE = 86400
 
 
 class TempAuth(object):
@@ -62,8 +71,97 @@ class TempAuth(object):
 
     See the proxy-server.conf-sample for more information.
 
+    Multiple Reseller Prefix Items:
+
+    The reseller prefix specifies which parts of the account namespace this
+    middleware is responsible for managing authentication and authorization.
+    By default, the prefix is 'AUTH' so accounts and tokens are prefixed
+    by 'AUTH\_'. When a request's token and/or path start with 'AUTH\_', this
+    middleware knows it is responsible.
+
+    We allow the reseller prefix to be a list. In tempauth, the first item
+    in the list is used as the prefix for tokens and user groups. The
+    other prefixes provide alternate accounts that user's can access. For
+    example if the reseller prefix list is 'AUTH, OTHER', a user with
+    admin access to 'AUTH_account' also has admin access to
+    'OTHER_account'.
+
+    Required Group:
+
+    The group .admin is normally needed to access an account (ACLs provide
+    an additional way to access an account). You can specify the
+    ``require_group`` parameter. This means that you also need the named group
+    to access an account. If you have several reseller prefix items, prefix
+    the ``require_group`` parameter with the appropriate prefix.
+
+    X-Service-Token:
+
+    If an X-Service-Token is presented in the request headers, the groups
+    derived from the token are appended to the roles derived from
+    X-Auth-Token. If X-Auth-Token is missing or invalid, X-Service-Token
+    is not processed.
+
+    The X-Service-Token is useful when combined with multiple reseller prefix
+    items. In the following configuration, accounts prefixed 'SERVICE\_'
+    are only accessible if X-Auth-Token is from the end-user and
+    X-Service-Token is from the ``glance`` user::
+
+       [filter:tempauth]
+       use = egg:swift#tempauth
+       reseller_prefix = AUTH, SERVICE
+       SERVICE_require_group = .service
+       user_admin_admin = admin .admin .reseller_admin
+       user_joeacct_joe = joepw .admin
+       user_maryacct_mary = marypw .admin
+       user_glance_glance = glancepw .service
+
+    The name .service is an example. Unlike .admin and .reseller_admin
+    it is not a reserved name.
+
+    Please note that ACLs can be set on service accounts and are matched
+    against the identity validated by X-Auth-Token. As such ACLs can grant
+    access to a service account's container without needing to provide a
+    service token, just like any other cross-reseller request using ACLs.
+
+    Account ACLs:
+        If a swift_owner issues a POST or PUT to the account, with the
+        X-Account-Access-Control header set in the request, then this may
+        allow certain types of access for additional users.
+
+        * Read-Only: Users with read-only access can list containers in the
+          account, list objects in any container, retrieve objects, and view
+          unprivileged account/container/object metadata.
+        * Read-Write: Users with read-write access can (in addition to the
+          read-only privileges) create objects, overwrite existing objects,
+          create new containers, and set unprivileged container/object
+          metadata.
+        * Admin: Users with admin access are swift_owners and can perform
+          any action, including viewing/setting privileged metadata (e.g.
+          changing account ACLs).
+
+    To generate headers for setting an account ACL::
+
+        from swift.common.middleware.acl import format_acl
+        acl_data = { 'admin': ['alice'], 'read-write': ['bob', 'carol'] }
+        header_value = format_acl(version=2, acl_dict=acl_data)
+
+    To generate a curl command line from the above::
+
+        token=...
+        storage_url=...
+        python -c '
+          from swift.common.middleware.acl import format_acl
+          acl_data = { 'admin': ['alice'], 'read-write': ['bob', 'carol'] }
+          headers = {'X-Account-Access-Control':
+                     format_acl(version=2, acl_dict=acl_data)}
+          header_str = ' '.join(["-H '%s: %s'" % (k, v)
+                                 for k, v in headers.items()])
+          print('curl -D- -X POST -H "x-auth-token: $token" %s '
+                '$storage_url' % header_str)
+        '
+
     :param app: The next WSGI app in the pipeline
-    :param conf: The dict of configuration values
+    :param conf: The dict of configuration values from the Paste config file
     """
 
     def __init__(self, app, conf):
@@ -71,23 +169,22 @@ class TempAuth(object):
         self.conf = conf
         self.logger = get_logger(conf, log_route='tempauth')
         self.log_headers = config_true_value(conf.get('log_headers', 'f'))
-        self.reseller_prefix = conf.get('reseller_prefix', 'AUTH').strip()
-        if self.reseller_prefix and self.reseller_prefix[-1] != '_':
-            self.reseller_prefix += '_'
+        self.reseller_prefixes, self.account_rules = \
+            config_read_reseller_options(conf, dict(require_group=''))
+        self.reseller_prefix = self.reseller_prefixes[0]
         self.logger.set_statsd_prefix('tempauth.%s' % (
             self.reseller_prefix if self.reseller_prefix else 'NONE',))
         self.auth_prefix = conf.get('auth_prefix', '/auth/')
-        if not self.auth_prefix:
+        if not self.auth_prefix or not self.auth_prefix.strip('/'):
+            self.logger.warning('Rewriting invalid auth prefix "%s" to '
+                                '"/auth/" (Non-empty auth prefix path '
+                                'is required)' % self.auth_prefix)
             self.auth_prefix = '/auth/'
-        if self.auth_prefix[0] != '/':
+        if not self.auth_prefix.startswith('/'):
             self.auth_prefix = '/' + self.auth_prefix
-        if self.auth_prefix[-1] != '/':
+        if not self.auth_prefix.endswith('/'):
             self.auth_prefix += '/'
-        self.token_life = int(conf.get('token_life', 86400))
-        self.allowed_sync_hosts = [
-            h.strip()
-            for h in conf.get('allowed_sync_hosts', '127.0.0.1').split(',')
-            if h.strip()]
+        self.token_life = int(conf.get('token_life', DEFAULT_TOKEN_LIFE))
         self.allow_overrides = config_true_value(
             conf.get('allow_overrides', 't'))
         self.storage_url_scheme = conf.get('storage_url_scheme', 'default')
@@ -139,55 +236,141 @@ class TempAuth(object):
             return self.handle(env, start_response)
         s3 = env.get('HTTP_AUTHORIZATION')
         token = env.get('HTTP_X_AUTH_TOKEN', env.get('HTTP_X_STORAGE_TOKEN'))
+        service_token = env.get('HTTP_X_SERVICE_TOKEN')
         if s3 or (token and token.startswith(self.reseller_prefix)):
             # Note: Empty reseller_prefix will match all tokens.
             groups = self.get_groups(env, token)
+            if service_token:
+                service_groups = self.get_groups(env, service_token)
+                if groups and service_groups:
+                    groups += ',' + service_groups
             if groups:
-                env['REMOTE_USER'] = groups
                 user = groups and groups.split(',', 1)[0] or ''
-                # We know the proxy logs the token, so we augment it just a bit
-                # to also log the authenticated user.
-                env['HTTP_X_AUTH_TOKEN'] = \
-                    '%s,%s' % (user, 's3' if s3 else token)
+                trans_id = env.get('swift.trans_id')
+                self.logger.debug('User: %s uses token %s (trans_id %s)' %
+                                  (user, 's3' if s3 else token, trans_id))
+                env['REMOTE_USER'] = groups
                 env['swift.authorize'] = self.authorize
                 env['swift.clean_acl'] = clean_acl
+                if '.reseller_admin' in groups:
+                    env['reseller_request'] = True
             else:
                 # Unauthorized token
-                if self.reseller_prefix:
+                if self.reseller_prefix and not s3:
                     # Because I know I'm the definitive auth for this token, I
                     # can deny it outright.
                     self.logger.increment('unauthorized')
-                    return HTTPUnauthorized()(env, start_response)
+                    try:
+                        vrs, realm, rest = split_path(env['PATH_INFO'],
+                                                      2, 3, True)
+                    except ValueError:
+                        realm = 'unknown'
+                    return HTTPUnauthorized(headers={
+                        'Www-Authenticate': 'Swift realm="%s"' % realm})(
+                            env, start_response)
                 # Because I'm not certain if I'm the definitive auth for empty
                 # reseller_prefixed tokens, I won't overwrite swift.authorize.
                 elif 'swift.authorize' not in env:
                     env['swift.authorize'] = self.denied_response
         else:
-            if self.reseller_prefix:
-                # With a non-empty reseller_prefix, I would like to be called
-                # back for anonymous access to accounts I know I'm the
-                # definitive auth for.
-                try:
-                    version, rest = split_path(env.get('PATH_INFO', ''),
-                                               1, 2, True)
-                except ValueError:
-                    version, rest = None, None
-                    self.logger.increment('errors')
-                if rest and rest.startswith(self.reseller_prefix):
-                    # Handle anonymous access to accounts I'm the definitive
-                    # auth for.
-                    env['swift.authorize'] = self.authorize
-                    env['swift.clean_acl'] = clean_acl
-                # Not my token, not my account, I can't authorize this request,
-                # deny all is a good idea if not already set...
-                elif 'swift.authorize' not in env:
-                    env['swift.authorize'] = self.denied_response
-            # Because I'm not certain if I'm the definitive auth for empty
-            # reseller_prefixed accounts, I won't overwrite swift.authorize.
-            elif 'swift.authorize' not in env:
+            if self._is_definitive_auth(env.get('PATH_INFO', '')):
+                # Handle anonymous access to accounts I'm the definitive
+                # auth for.
                 env['swift.authorize'] = self.authorize
                 env['swift.clean_acl'] = clean_acl
+            elif self.reseller_prefix == '':
+                # Because I'm not certain if I'm the definitive auth, I won't
+                # overwrite swift.authorize.
+                if 'swift.authorize' not in env:
+                    env['swift.authorize'] = self.authorize
+                    env['swift.clean_acl'] = clean_acl
+            else:
+                # Not my token, not my account, I can't authorize this request,
+                # deny all is a good idea if not already set...
+                if 'swift.authorize' not in env:
+                    env['swift.authorize'] = self.denied_response
+
         return self.app(env, start_response)
+
+    def _is_definitive_auth(self, path):
+        """
+        Determine if we are the definitive auth
+
+        Determines if we are the definitive auth for a given path.
+        If the account name is prefixed with something matching one
+        of the reseller_prefix items, then we are the auth (return True)
+        Non-matching: we are not the auth.
+        However, one of the reseller_prefix items can be blank. If
+        so, we cannot always be definite so return False.
+
+        :param path: A path (e.g., /v1/AUTH_joesaccount/c/o)
+        :return:True if we are definitive auth
+        """
+        try:
+            version, account, rest = split_path(path, 1, 3, True)
+        except ValueError:
+            return False
+        if account:
+            return bool(self._get_account_prefix(account))
+        return False
+
+    def _non_empty_reseller_prefixes(self):
+        return iter([pre for pre in self.reseller_prefixes if pre != ''])
+
+    def _get_account_prefix(self, account):
+        """
+        Get the prefix of an account
+
+        Determines which reseller prefix matches the account and returns
+        that prefix. If account does not start with one of the known
+        reseller prefixes, returns None.
+
+        :param account: Account name (e.g., AUTH_joesaccount) or None
+        :return: The prefix string (examples: 'AUTH_', 'SERVICE_', '')
+                 If we can't match the prefix of the account, return None
+        """
+        if account is None:
+            return None
+        # Empty prefix matches everything, so try to match others first
+        for prefix in self._non_empty_reseller_prefixes():
+            if account.startswith(prefix):
+                return prefix
+        if '' in self.reseller_prefixes:
+            return ''
+        return None
+
+    def _dot_account(self, account):
+        """
+        Detect if account starts with dot character after the prefix
+
+        :param account: account in path (e.g., AUTH_joesaccount)
+        :return:True if name starts with dot character
+        """
+        prefix = self._get_account_prefix(account)
+        return prefix is not None and account[len(prefix)] == '.'
+
+    def _get_user_groups(self, account, account_user, account_id):
+        """
+        :param account: example: test
+        :param account_user: example: test:tester
+        :param account_id: example: AUTH_test
+        :return: a comma separated string of group names. The group names are
+                 as follows: account,account_user,groups...
+                 If .admin is in the groups, this is replaced by all the
+                 possible account ids. For example, for user joe, account acct
+                 and resellers AUTH_, OTHER_, the returned string is as
+                 follows: acct,acct:joe,AUTH_acct,OTHER_acct
+        """
+        groups = [account, account_user]
+        groups.extend(self.users[account_user]['groups'])
+        if '.admin' in groups:
+            groups.remove('.admin')
+            for prefix in self._non_empty_reseller_prefixes():
+                groups.append('%s%s' % (prefix, account))
+            if account_id not in groups:
+                groups.append(account_id)
+        groups = ','.join(groups)
+        return groups
 
     def get_groups(self, env, token):
         """
@@ -195,7 +378,6 @@ class TempAuth(object):
 
         :param env: The current WSGI environment dictionary.
         :param token: Token to validate and return a group string for.
-
         :returns: None if the token is invalid or a string containing a comma
                   separated list of groups the authenticated user is a member
                   of. The first group in the list is also considered a unique
@@ -226,60 +408,182 @@ class TempAuth(object):
             s = base64.encodestring(hmac.new(key, msg, sha1).digest()).strip()
             if s != sign:
                 return None
-            groups = [account, account_user]
-            groups.extend(self.users[account_user]['groups'])
-            if '.admin' in groups:
-                groups.remove('.admin')
-                groups.append(account_id)
-            groups = ','.join(groups)
+            groups = self._get_user_groups(account, account_user, account_id)
 
         return groups
+
+    def account_acls(self, req):
+        """
+        Return a dict of ACL data from the account server via get_account_info.
+
+        Auth systems may define their own format, serialization, structure,
+        and capabilities implemented in the ACL headers and persisted in the
+        sysmeta data.  However, auth systems are strongly encouraged to be
+        interoperable with Tempauth.
+
+        Account ACLs are set and retrieved via the header
+           X-Account-Access-Control
+
+        For header format and syntax, see:
+         * :func:`swift.common.middleware.acl.parse_acl()`
+         * :func:`swift.common.middleware.acl.format_acl()`
+        """
+        info = get_account_info(req.environ, self.app, swift_source='TA')
+        try:
+            acls = acls_from_account_info(info)
+        except ValueError as e1:
+            self.logger.warning("Invalid ACL stored in metadata: %r" % e1)
+            return None
+        except NotImplementedError as e2:
+            self.logger.warning(
+                "ACL version exceeds middleware version: %r"
+                % e2)
+            return None
+        return acls
+
+    def extract_acl_and_report_errors(self, req):
+        """
+        Return a user-readable string indicating the errors in the input ACL,
+        or None if there are no errors.
+        """
+        acl_header = 'x-account-access-control'
+        acl_data = req.headers.get(acl_header)
+        result = parse_acl(version=2, data=acl_data)
+        if result is None:
+            return 'Syntax error in input (%r)' % acl_data
+
+        tempauth_acl_keys = 'admin read-write read-only'.split()
+        for key in result:
+            # While it is possible to construct auth systems that collaborate
+            # on ACLs, TempAuth is not such an auth system.  At this point,
+            # it thinks it is authoritative.
+            if key not in tempauth_acl_keys:
+                return "Key '%s' not recognized" % key
+
+        for key in tempauth_acl_keys:
+            if key not in result:
+                continue
+            if not isinstance(result[key], list):
+                return "Value for key '%s' must be a list" % key
+            for grantee in result[key]:
+                if not isinstance(grantee, six.string_types):
+                    return "Elements of '%s' list must be strings" % key
+
+        # Everything looks fine, no errors found
+        internal_hdr = get_sys_meta_prefix('account') + 'core-access-control'
+        req.headers[internal_hdr] = req.headers.pop(acl_header)
+        return None
 
     def authorize(self, req):
         """
         Returns None if the request is authorized to continue or a standard
         WSGI response callable if not.
         """
-
         try:
-            version, account, container, obj = split_path(req.path, 1, 4, True)
+            _junk, account, container, obj = req.split_path(1, 4, True)
         except ValueError:
             self.logger.increment('errors')
             return HTTPNotFound(request=req)
-        if not account or not account.startswith(self.reseller_prefix):
+
+        if self._get_account_prefix(account) is None:
+            self.logger.debug("Account name: %s doesn't start with "
+                              "reseller_prefix(s): %s."
+                              % (account, ','.join(self.reseller_prefixes)))
             return self.denied_response(req)
+
+        # At this point, TempAuth is convinced that it is authoritative.
+        # If you are sending an ACL header, it must be syntactically valid
+        # according to TempAuth's rules for ACL syntax.
+        acl_data = req.headers.get('x-account-access-control')
+        if acl_data is not None:
+            error = self.extract_acl_and_report_errors(req)
+            if error:
+                msg = 'X-Account-Access-Control invalid: %s\n\nInput: %s\n' % (
+                    error, acl_data)
+                headers = [('Content-Type', 'text/plain; charset=UTF-8')]
+                return HTTPBadRequest(request=req, headers=headers, body=msg)
+
         user_groups = (req.remote_user or '').split(',')
+        account_user = user_groups[1] if len(user_groups) > 1 else None
+
         if '.reseller_admin' in user_groups and \
-                account != self.reseller_prefix and \
-                account[len(self.reseller_prefix)] != '.':
+                account not in self.reseller_prefixes and \
+                not self._dot_account(account):
             req.environ['swift_owner'] = True
+            self.logger.debug("User %s has reseller admin authorizing."
+                              % account_user)
             return None
+
         if account in user_groups and \
                 (req.method not in ('DELETE', 'PUT') or container):
-            # If the user is admin for the account and is not trying to do an
-            # account DELETE or PUT...
-            req.environ['swift_owner'] = True
+            # The user is admin for the account and is not trying to do an
+            # account DELETE or PUT
+            account_prefix = self._get_account_prefix(account)
+            require_group = self.account_rules.get(account_prefix).get(
+                'require_group')
+            if require_group and require_group in user_groups:
+                req.environ['swift_owner'] = True
+                self.logger.debug("User %s has admin and %s group."
+                                  " Authorizing." % (account_user,
+                                                     require_group))
+                return None
+            elif not require_group:
+                req.environ['swift_owner'] = True
+                self.logger.debug("User %s has admin authorizing."
+                                  % account_user)
+                return None
+
+        if (req.environ.get('swift_sync_key')
+                and (req.environ['swift_sync_key'] ==
+                     req.headers.get('x-container-sync-key', None))
+                and 'x-timestamp' in req.headers):
+            self.logger.debug("Allow request with container sync-key: %s."
+                              % req.environ['swift_sync_key'])
             return None
-        if (req.environ.get('swift_sync_key') and
-            req.environ['swift_sync_key'] ==
-                req.headers.get('x-container-sync-key', None) and
-            'x-timestamp' in req.headers and
-            (req.remote_addr in self.allowed_sync_hosts or
-             get_remote_client(req) in self.allowed_sync_hosts)):
-            return None
+
         if req.method == 'OPTIONS':
-            #allow OPTIONS requests to proceed as normal
+            # allow OPTIONS requests to proceed as normal
+            self.logger.debug("Allow OPTIONS request.")
             return None
+
         referrers, groups = parse_acl(getattr(req, 'acl', None))
+
         if referrer_allowed(req.referer, referrers):
             if obj or '.rlistings' in groups:
+                self.logger.debug("Allow authorizing %s via referer ACL."
+                                  % req.referer)
                 return None
-            return self.denied_response(req)
-        if not req.remote_user:
-            return self.denied_response(req)
+
         for user_group in user_groups:
             if user_group in groups:
+                self.logger.debug("User %s allowed in ACL: %s authorizing."
+                                  % (account_user, user_group))
                 return None
+
+        # Check for access via X-Account-Access-Control
+        acct_acls = self.account_acls(req)
+        if acct_acls:
+            # At least one account ACL is set in this account's sysmeta data,
+            # so we should see whether this user is authorized by the ACLs.
+            user_group_set = set(user_groups)
+            if user_group_set.intersection(acct_acls['admin']):
+                req.environ['swift_owner'] = True
+                self.logger.debug('User %s allowed by X-Account-Access-Control'
+                                  ' (admin)' % account_user)
+                return None
+            if (user_group_set.intersection(acct_acls['read-write']) and
+                    (container or req.method in ('GET', 'HEAD'))):
+                # The RW ACL allows all operations to containers/objects, but
+                # only GET/HEAD to accounts (and OPTIONS, above)
+                self.logger.debug('User %s allowed by X-Account-Access-Control'
+                                  ' (read-write)' % account_user)
+                return None
+            if (user_group_set.intersection(acct_acls['read-only']) and
+                    req.method in ('GET', 'HEAD')):
+                self.logger.debug('User %s allowed by X-Account-Access-Control'
+                                  ' (read-only)' % account_user)
+                return None
+
         return self.denied_response(req)
 
     def denied_response(self, req):
@@ -312,20 +616,9 @@ class TempAuth(object):
             if 'x-storage-token' in req.headers and \
                     'x-auth-token' not in req.headers:
                 req.headers['x-auth-token'] = req.headers['x-storage-token']
-            if 'eventlet.posthooks' in env:
-                env['eventlet.posthooks'].append(
-                    (self.posthooklogger, (req,), {}))
-                return self.handle_request(req)(env, start_response)
-            else:
-                # Lack of posthook support means that we have to log on the
-                # start of the response, rather than after all the data has
-                # been sent. This prevents logging client disconnects
-                # differently than full transmissions.
-                response = self.handle_request(req)(env, start_response)
-                self.posthooklogger(env, req)
-                return response
+            return self.handle_request(req)(env, start_response)
         except (Exception, Timeout):
-            print "EXCEPTION IN handle: %s: %s" % (format_exc(), env)
+            print("EXCEPTION IN handle: %s: %s" % (format_exc(), env))
             self.logger.increment('errors')
             start_response('500 Server Error',
                            [('Content-Type', 'text/plain')])
@@ -341,11 +634,8 @@ class TempAuth(object):
         req.start_time = time()
         handler = None
         try:
-            version, account, user, _junk = split_path(
-                req.path_info,
-                minsegs=1,
-                maxsegs=4,
-                rest_with_last=True)
+            version, account, user, _junk = split_path(req.path_info,
+                                                       1, 4, True)
         except ValueError:
             self.logger.increment('errors')
             return HTTPNotFound(request=req)
@@ -385,8 +675,7 @@ class TempAuth(object):
         """
         # Validate the request info
         try:
-            pathsegs = split_path(req.path_info, minsegs=1, maxsegs=3,
-                                  rest_with_last=True)
+            pathsegs = split_path(req.path_info, 1, 3, True)
         except ValueError:
             self.logger.increment('errors')
             return HTTPNotFound(request=req)
@@ -397,11 +686,15 @@ class TempAuth(object):
                 user = req.headers.get('x-auth-user')
                 if not user or ':' not in user:
                     self.logger.increment('token_denied')
-                    return HTTPUnauthorized(request=req)
+                    auth = 'Swift realm="%s"' % account
+                    return HTTPUnauthorized(request=req,
+                                            headers={'Www-Authenticate': auth})
                 account2, user = user.split(':', 1)
                 if account != account2:
                     self.logger.increment('token_denied')
-                    return HTTPUnauthorized(request=req)
+                    auth = 'Swift realm="%s"' % account
+                    return HTTPUnauthorized(request=req,
+                                            headers={'Www-Authenticate': auth})
             key = req.headers.get('x-storage-pass')
             if not key:
                 key = req.headers.get('x-auth-key')
@@ -411,7 +704,9 @@ class TempAuth(object):
                 user = req.headers.get('x-storage-user')
             if not user or ':' not in user:
                 self.logger.increment('token_denied')
-                return HTTPUnauthorized(request=req)
+                auth = 'Swift realm="unknown"'
+                return HTTPUnauthorized(request=req,
+                                        headers={'Www-Authenticate': auth})
             account, user = user.split(':', 1)
             key = req.headers.get('x-auth-key')
             if not key:
@@ -420,15 +715,23 @@ class TempAuth(object):
             return HTTPBadRequest(request=req)
         if not all((account, user, key)):
             self.logger.increment('token_denied')
-            return HTTPUnauthorized(request=req)
+            realm = account or 'unknown'
+            return HTTPUnauthorized(request=req, headers={'Www-Authenticate':
+                                                          'Swift realm="%s"' %
+                                                          realm})
         # Authenticate user
         account_user = account + ':' + user
         if account_user not in self.users:
             self.logger.increment('token_denied')
-            return HTTPUnauthorized(request=req)
+            auth = 'Swift realm="%s"' % account
+            return HTTPUnauthorized(request=req,
+                                    headers={'Www-Authenticate': auth})
         if self.users[account_user]['key'] != key:
             self.logger.increment('token_denied')
-            return HTTPUnauthorized(request=req)
+            auth = 'Swift realm="unknown"'
+            return HTTPUnauthorized(request=req,
+                                    headers={'Www-Authenticate': auth})
+        account_id = self.users[account_user]['url'].rsplit('/', 1)[-1]
         # Get memcache client
         memcache_client = cache_from_env(req.environ)
         if not memcache_client:
@@ -442,79 +745,44 @@ class TempAuth(object):
                 '%s/token/%s' % (self.reseller_prefix, candidate_token)
             cached_auth_data = memcache_client.get(memcache_token_key)
             if cached_auth_data:
-                expires, groups = cached_auth_data
-                if expires > time():
+                expires, old_groups = cached_auth_data
+                old_groups = old_groups.split(',')
+                new_groups = self._get_user_groups(account, account_user,
+                                                   account_id)
+
+                if expires > time() and \
+                        set(old_groups) == set(new_groups.split(',')):
                     token = candidate_token
         # Create a new token if one didn't exist
         if not token:
             # Generate new token
             token = '%stk%s' % (self.reseller_prefix, uuid4().hex)
             expires = time() + self.token_life
-            groups = [account, account_user]
-            groups.extend(self.users[account_user]['groups'])
-            if '.admin' in groups:
-                groups.remove('.admin')
-                account_id = self.users[account_user]['url'].rsplit('/', 1)[-1]
-                groups.append(account_id)
-            groups = ','.join(groups)
+            groups = self._get_user_groups(account, account_user, account_id)
             # Save token
             memcache_token_key = '%s/token/%s' % (self.reseller_prefix, token)
             memcache_client.set(memcache_token_key, (expires, groups),
-                                timeout=float(expires - time()))
+                                time=float(expires - time()))
             # Record the token with the user info for future use.
             memcache_user_key = \
                 '%s/user/%s' % (self.reseller_prefix, account_user)
             memcache_client.set(memcache_user_key, token,
-                                timeout=float(expires - time()))
+                                time=float(expires - time()))
         resp = Response(request=req, headers={
-            'x-auth-token': token, 'x-storage-token': token})
-        url = self.users[account_user]['url'].replace('$HOST', resp.host_url())
+            'x-auth-token': token, 'x-storage-token': token,
+            'x-auth-token-expires': str(int(expires - time()))})
+        url = self.users[account_user]['url'].replace('$HOST', resp.host_url)
         if self.storage_url_scheme != 'default':
             url = self.storage_url_scheme + ':' + url.split(':', 1)[1]
         resp.headers['x-storage-url'] = url
         return resp
-
-    def posthooklogger(self, env, req):
-        if not req.path.startswith(self.auth_prefix):
-            return
-        response = getattr(req, 'response', None)
-        if not response:
-            return
-        trans_time = '%.4f' % (time() - req.start_time)
-        the_request = quote(unquote(req.path))
-        if req.query_string:
-            the_request = the_request + '?' + req.query_string
-        # remote user for zeus
-        client = req.headers.get('x-cluster-client-ip')
-        if not client and 'x-forwarded-for' in req.headers:
-            # remote user for other lbs
-            client = req.headers['x-forwarded-for'].split(',')[0].strip()
-        logged_headers = None
-        if self.log_headers:
-            logged_headers = '\n'.join('%s: %s' % (k, v)
-                                       for k, v in req.headers.items())
-        status_int = response.status_int
-        if getattr(req, 'client_disconnect', False) or \
-                getattr(response, 'client_disconnect', False):
-            status_int = HTTP_CLIENT_CLOSED_REQUEST
-        self.logger.info(
-            ' '.join(quote(str(x)) for x in (client or '-',
-            req.remote_addr or '-', strftime('%d/%b/%Y/%H/%M/%S', gmtime()),
-            req.method, the_request, req.environ['SERVER_PROTOCOL'],
-            status_int, req.referer or '-', req.user_agent or '-',
-            req.headers.get('x-auth-token',
-                            req.headers.get('x-auth-admin-user', '-')),
-            getattr(req, 'bytes_transferred', 0) or '-',
-            getattr(response, 'bytes_transferred', 0) or '-',
-            req.headers.get('etag', '-'),
-            req.environ.get('swift.trans_id', '-'), logged_headers or '-',
-            trans_time)))
 
 
 def filter_factory(global_conf, **local_conf):
     """Returns a WSGI filter app for use with paste.deploy."""
     conf = global_conf.copy()
     conf.update(local_conf)
+    register_swift_info('tempauth', account_acls=True)
 
     def auth_filter(app):
         return TempAuth(app, conf)

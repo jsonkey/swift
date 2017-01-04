@@ -1,4 +1,4 @@
-# Copyright (c) 2010-2012 OpenStack, LLC.
+# Copyright (c) 2010-2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,17 +14,29 @@
 # limitations under the License.
 
 import errno
+import json
 import os
+import time
+from swift import gettext_ as _
 
+from swift import __version__ as swiftver
+from swift.common.storage_policy import POLICIES
 from swift.common.swob import Request, Response
-from swift.common.utils import split_path, get_logger, config_true_value
+from swift.common.utils import get_logger, config_true_value, \
+    SWIFT_CONF_FILE
 from swift.common.constraints import check_mount
 from resource import getpagesize
 from hashlib import md5
-try:
-    import simplejson as json
-except ImportError:
-    import json
+
+
+MD5_BLOCK_READ_BYTES = 4096
+
+
+def _hash_for_ringfile(f):
+    md5sum = md5()
+    for block in iter(lambda: f.read(MD5_BLOCK_READ_BYTES), ''):
+        md5sum.update(block)
+    return md5sum.hexdigest()
 
 
 class ReconMiddleware(object):
@@ -33,7 +45,7 @@ class ReconMiddleware(object):
 
     /recon/load|mem|async... will return various system metrics.
 
-    Needs to be added to the pipeline and a requires a filter
+    Needs to be added to the pipeline and requires a filter
     declaration in the object-server.conf:
 
     [filter:recon]
@@ -43,7 +55,7 @@ class ReconMiddleware(object):
 
     def __init__(self, app, conf, *args, **kwargs):
         self.app = app
-        self.devices = conf.get('devices', '/srv/node/')
+        self.devices = conf.get('devices', '/srv/node')
         swift_dir = conf.get('swift_dir', '/etc/swift')
         self.logger = get_logger(conf, log_route='recon')
         self.recon_cache_path = conf.get('recon_cache_path',
@@ -54,11 +66,17 @@ class ReconMiddleware(object):
                                                   'container.recon')
         self.account_recon_cache = os.path.join(self.recon_cache_path,
                                                 'account.recon')
+        self.drive_recon_cache = os.path.join(self.recon_cache_path,
+                                              'drive.recon')
         self.account_ring_path = os.path.join(swift_dir, 'account.ring.gz')
         self.container_ring_path = os.path.join(swift_dir, 'container.ring.gz')
-        self.object_ring_path = os.path.join(swift_dir, 'object.ring.gz')
-        self.rings = [self.account_ring_path, self.container_ring_path,
-                      self.object_ring_path]
+
+        self.rings = [self.account_ring_path, self.container_ring_path]
+        # include all object ring files (for all policies)
+        for policy in POLICIES:
+            self.rings.append(os.path.join(swift_dir,
+                                           policy.ring_name + '.ring.gz'))
+
         self.mount_check = config_true_value(conf.get('mount_check', 'true'))
 
     def _from_recon_cache(self, cache_keys, cache_file, openr=open):
@@ -67,7 +85,7 @@ class ReconMiddleware(object):
         :params cache_keys: list of cache items to retrieve
         :params cache_file: cache file to retrieve items from.
         :params openr: open to use [for unittests]
-        :return: dict of cache items and their value or none if not found
+        :return: dict of cache items and their values or none if not found
         """
         try:
             with openr(cache_file, 'r') as f:
@@ -80,6 +98,11 @@ class ReconMiddleware(object):
         except Exception:
             self.logger.exception(_('Error retrieving recon data'))
         return dict((key, None) for key in cache_keys)
+
+    def get_version(self):
+        """get swift version"""
+        verinfo = {'version': swiftver}
+        return verinfo
 
     def get_mounted(self, openr=open):
         """get ALL mounted fs from /proc/mounts"""
@@ -118,18 +141,26 @@ class ReconMiddleware(object):
         return self._from_recon_cache(['async_pending'],
                                       self.object_recon_cache)
 
+    def get_driveaudit_error(self):
+        """get # of drive audit errors"""
+        return self._from_recon_cache(['drive_audit_errors'],
+                                      self.drive_recon_cache)
+
     def get_replication_info(self, recon_type):
         """get replication info"""
+        replication_list = ['replication_time',
+                            'replication_stats',
+                            'replication_last']
         if recon_type == 'account':
-            return self._from_recon_cache(['replication_time',
-                                           'replication_stats'],
+            return self._from_recon_cache(replication_list,
                                           self.account_recon_cache)
         elif recon_type == 'container':
-            return self._from_recon_cache(['replication_time',
-                                           'replication_stats'],
+            return self._from_recon_cache(replication_list,
                                           self.container_recon_cache)
         elif recon_type == 'object':
-            return self._from_recon_cache(['object_replication_time'],
+            replication_list += ['object_replication_time',
+                                 'object_replication_last']
+            return self._from_recon_cache(replication_list,
                                           self.object_recon_cache)
         else:
             return None
@@ -185,9 +216,15 @@ class ReconMiddleware(object):
         """list unmounted (failed?) devices"""
         mountlist = []
         for entry in os.listdir(self.devices):
-            mpoint = {'device': entry,
-                      'mounted': check_mount(self.devices, entry)}
-            if not mpoint['mounted']:
+            if not os.path.isdir(os.path.join(self.devices, entry)):
+                continue
+
+            try:
+                mounted = check_mount(self.devices, entry)
+            except OSError as err:
+                mounted = str(err)
+            mpoint = {'device': entry, 'mounted': mounted}
+            if mpoint['mounted'] is not True:
                 mountlist.append(mpoint)
         return mountlist
 
@@ -195,7 +232,17 @@ class ReconMiddleware(object):
         """get disk utilization statistics"""
         devices = []
         for entry in os.listdir(self.devices):
-            if check_mount(self.devices, entry):
+            if not os.path.isdir(os.path.join(self.devices, entry)):
+                continue
+
+            try:
+                mounted = check_mount(self.devices, entry)
+            except OSError as err:
+                devices.append({'device': entry, 'mounted': str(err),
+                                'size': '', 'used': '', 'avail': ''})
+                continue
+
+            if mounted:
                 path = os.path.join(self.devices, entry)
                 disk = os.statvfs(path)
                 capacity = disk.f_bsize * disk.f_blocks
@@ -213,32 +260,57 @@ class ReconMiddleware(object):
         """get all ring md5sum's"""
         sums = {}
         for ringfile in self.rings:
-            md5sum = md5()
             if os.path.exists(ringfile):
                 try:
                     with openr(ringfile, 'rb') as f:
-                        block = f.read(4096)
-                        while block:
-                            md5sum.update(block)
-                            block = f.read(4096)
-                    sums[ringfile] = md5sum.hexdigest()
-                except IOError, err:
+                        sums[ringfile] = _hash_for_ringfile(f)
+                except IOError as err:
                     sums[ringfile] = None
                     if err.errno != errno.ENOENT:
                         self.logger.exception(_('Error reading ringfile'))
         return sums
 
+    def get_swift_conf_md5(self, openr=open):
+        """get md5 of swift.conf"""
+        md5sum = md5()
+        try:
+            with openr(SWIFT_CONF_FILE, 'r') as fh:
+                chunk = fh.read(4096)
+                while chunk:
+                    md5sum.update(chunk)
+                    chunk = fh.read(4096)
+        except IOError as err:
+            if err.errno != errno.ENOENT:
+                self.logger.exception(_('Error reading swift.conf'))
+            hexsum = None
+        else:
+            hexsum = md5sum.hexdigest()
+        return {SWIFT_CONF_FILE: hexsum}
+
     def get_quarantine_count(self):
         """get obj/container/account quarantine counts"""
-        qcounts = {"objects": 0, "containers": 0, "accounts": 0}
+        qcounts = {"objects": 0, "containers": 0, "accounts": 0,
+                   "policies": {}}
         qdir = "quarantined"
         for device in os.listdir(self.devices):
-            for qtype in qcounts:
-                qtgt = os.path.join(self.devices, device, qdir, qtype)
-                if os.path.exists(qtgt):
+            qpath = os.path.join(self.devices, device, qdir)
+            if os.path.exists(qpath):
+                for qtype in os.listdir(qpath):
+                    qtgt = os.path.join(qpath, qtype)
                     linkcount = os.lstat(qtgt).st_nlink
                     if linkcount > 2:
-                        qcounts[qtype] += linkcount - 2
+                        if qtype.startswith('objects'):
+                            if '-' in qtype:
+                                pkey = qtype.split('-', 1)[1]
+                            else:
+                                pkey = '0'
+                            qcounts['policies'].setdefault(pkey,
+                                                           {'objects': 0})
+                            qcounts['policies'][pkey]['objects'] \
+                                += linkcount - 2
+                            qcounts['objects'] += linkcount - 2
+                        else:
+                            qcounts[qtype] += linkcount - 2
         return qcounts
 
     def get_socket_info(self, openr=open):
@@ -272,8 +344,13 @@ class ReconMiddleware(object):
                 raise
         return sockstat
 
+    def get_time(self):
+        """get current time"""
+
+        return time.time()
+
     def GET(self, req):
-        root, rcheck, rtype = split_path(req.path, 1, 3, True)
+        root, rcheck, rtype = req.split_path(1, 3, True)
         all_rtypes = ['account', 'container', 'object']
         if rcheck == "mem":
             content = self.get_mem()
@@ -284,7 +361,7 @@ class ReconMiddleware(object):
         elif rcheck == 'replication' and rtype in all_rtypes:
             content = self.get_replication_info(rtype)
         elif rcheck == 'replication' and rtype is None:
-            #handle old style object replication requests
+            # handle old style object replication requests
             content = self.get_replication_info('object')
         elif rcheck == "devices":
             content = self.get_device_info()
@@ -302,10 +379,18 @@ class ReconMiddleware(object):
             content = self.get_diskusage()
         elif rcheck == "ringmd5":
             content = self.get_ring_md5()
+        elif rcheck == "swiftconfmd5":
+            content = self.get_swift_conf_md5()
         elif rcheck == "quarantined":
             content = self.get_quarantine_count()
         elif rcheck == "sockstat":
             content = self.get_socket_info()
+        elif rcheck == "version":
+            content = self.get_version()
+        elif rcheck == "driveaudit":
+            content = self.get_driveaudit_error()
+        elif rcheck == "time":
+            content = self.get_time()
         else:
             content = "Invalid path: %s" % req.path
             return Response(request=req, status="404 Not Found",

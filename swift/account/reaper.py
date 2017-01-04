@@ -1,4 +1,4 @@
-# Copyright (c) 2010-2012 OpenStack, LLC.
+# Copyright (c) 2010-2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,20 +15,28 @@
 
 import os
 import random
+import socket
+from swift import gettext_ as _
 from logging import DEBUG
 from math import sqrt
 from time import time
+from hashlib import md5
+import itertools
 
 from eventlet import GreenPool, sleep, Timeout
+import six
 
 import swift.common.db
-from swift.account.server import DATADIR
-from swift.common.db import AccountBroker
-from swift.common.direct_client import ClientException, \
-    direct_delete_container, direct_delete_object, direct_get_container
+from swift.account.backend import AccountBroker, DATADIR
+from swift.common.direct_client import direct_delete_container, \
+    direct_delete_object, direct_get_container
+from swift.common.exceptions import ClientException
 from swift.common.ring import Ring
-from swift.common.utils import get_logger, whataremyips, config_true_value
+from swift.common.ring.utils import is_local_device
+from swift.common.utils import get_logger, whataremyips, ismount, \
+    config_true_value, Timestamp
 from swift.common.daemon import Daemon
+from swift.common.storage_policy import POLICIES, PolicyError
 
 
 class AccountReaper(Daemon):
@@ -52,9 +60,9 @@ class AccountReaper(Daemon):
     configuration parameters.
     """
 
-    def __init__(self, conf):
+    def __init__(self, conf, logger=None):
         self.conf = conf
-        self.logger = get_logger(conf, log_route='account-reaper')
+        self.logger = logger or get_logger(conf, log_route='account-reaper')
         self.devices = conf.get('devices', '/srv/node')
         self.mount_check = config_true_value(conf.get('mount_check', 'true'))
         self.interval = int(conf.get('interval', 3600))
@@ -62,9 +70,10 @@ class AccountReaper(Daemon):
         self.account_ring = None
         self.container_ring = None
         self.object_ring = None
-        self.node_timeout = int(conf.get('node_timeout', 10))
+        self.node_timeout = float(conf.get('node_timeout', 10))
         self.conn_timeout = float(conf.get('conn_timeout', 0.5))
-        self.myips = whataremyips()
+        self.myips = whataremyips(conf.get('bind_ip', '0.0.0.0'))
+        self.bind_port = int(conf.get('bind_port', 6202))
         self.concurrency = int(conf.get('concurrency', 25))
         self.container_concurrency = self.object_concurrency = \
             sqrt(self.concurrency)
@@ -72,32 +81,39 @@ class AccountReaper(Daemon):
         swift.common.db.DB_PREALLOCATION = \
             config_true_value(conf.get('db_preallocation', 'f'))
         self.delay_reaping = int(conf.get('delay_reaping') or 0)
+        reap_warn_after = float(conf.get('reap_warn_after') or 86400 * 30)
+        self.reap_not_done_after = reap_warn_after + self.delay_reaping
+        self.start_time = time()
+        self.reset_stats()
 
     def get_account_ring(self):
-        """ The account :class:`swift.common.ring.Ring` for the cluster. """
+        """The account :class:`swift.common.ring.Ring` for the cluster."""
         if not self.account_ring:
             self.account_ring = Ring(self.swift_dir, ring_name='account')
         return self.account_ring
 
     def get_container_ring(self):
-        """ The container :class:`swift.common.ring.Ring` for the cluster. """
+        """The container :class:`swift.common.ring.Ring` for the cluster."""
         if not self.container_ring:
             self.container_ring = Ring(self.swift_dir, ring_name='container')
         return self.container_ring
 
-    def get_object_ring(self):
-        """ The object :class:`swift.common.ring.Ring` for the cluster. """
-        if not self.object_ring:
-            self.object_ring = Ring(self.swift_dir, ring_name='object')
-        return self.object_ring
+    def get_object_ring(self, policy_idx):
+        """
+        Get the ring identified by the policy index
+
+        :param policy_idx: Storage policy index
+        :returns: A ring matching the storage policy
+        """
+        return POLICIES.get_object_ring(policy_idx, self.swift_dir)
 
     def run_forever(self, *args, **kwargs):
-        """
-        Main entry point when running the reaper in its normal daemon mode.
-        This repeatedly calls :func:`reap_once` no quicker than the
+        """Main entry point when running the reaper in normal daemon mode.
+
+        This repeatedly calls :func:`run_once` no quicker than the
         configuration interval.
         """
-        self.logger.debug(_('Daemon started.'))
+        self.logger.debug('Daemon started.')
         sleep(random.random() * self.interval)
         while True:
             begin = time()
@@ -113,11 +129,11 @@ class AccountReaper(Daemon):
         repeatedly by :func:`run_forever`. This will call :func:`reap_device`
         once for each device on the server.
         """
-        self.logger.debug(_('Begin devices pass: %s'), self.devices)
+        self.logger.debug('Begin devices pass: %s', self.devices)
         begin = time()
         try:
             for device in os.listdir(self.devices):
-                if self.mount_check and not os.path.ismount(
+                if self.mount_check and not ismount(
                         os.path.join(self.devices, device)):
                     self.logger.increment('errors')
                     self.logger.debug(
@@ -151,9 +167,18 @@ class AccountReaper(Daemon):
             if not partition.isdigit():
                 continue
             nodes = self.get_account_ring().get_part_nodes(int(partition))
-            if nodes[0]['ip'] not in self.myips or \
-                    not os.path.isdir(partition_path):
+            if not os.path.isdir(partition_path):
                 continue
+            container_shard = None
+            for container_shard, node in enumerate(nodes):
+                if is_local_device(self.myips, None, node['ip'], None) and \
+                        (not self.bind_port or
+                         self.bind_port == node['port']) and \
+                        (device == node['device']):
+                    break
+            else:
+                continue
+
             for suffix in os.listdir(partition_path):
                 suffix_path = os.path.join(partition_path, suffix)
                 if not os.path.isdir(suffix_path):
@@ -171,9 +196,20 @@ class AccountReaper(Daemon):
                                 AccountBroker(os.path.join(hsh_path, fname))
                             if broker.is_status_deleted() and \
                                     not broker.empty():
-                                self.reap_account(broker, partition, nodes)
+                                self.reap_account(
+                                    broker, partition, nodes,
+                                    container_shard=container_shard)
 
-    def reap_account(self, broker, partition, nodes):
+    def reset_stats(self):
+        self.stats_return_codes = {}
+        self.stats_containers_deleted = 0
+        self.stats_objects_deleted = 0
+        self.stats_containers_remaining = 0
+        self.stats_objects_remaining = 0
+        self.stats_containers_possibly_remaining = 0
+        self.stats_objects_possibly_remaining = 0
+
+    def reap_account(self, broker, partition, nodes, container_shard=None):
         """
         Called once per pass for each account this server is the primary for
         and attempts to delete the data for the given account. The reaper will
@@ -200,10 +236,12 @@ class AccountReaper(Daemon):
         :param broker: The AccountBroker for the account to delete.
         :param partition: The partition in the account ring the account is on.
         :param nodes: The primary node dicts for the account to delete.
+        :param container_shard: int used to shard containers reaped. If None,
+                                will reap all containers.
 
         .. seealso::
 
-            :class:`swift.common.db.AccountBroker` for the broker class.
+            :class:`swift.account.backend.AccountBroker` for the broker class.
 
         .. seealso::
 
@@ -212,27 +250,30 @@ class AccountReaper(Daemon):
         """
         begin = time()
         info = broker.get_info()
-        if time() - float(info['delete_timestamp']) <= self.delay_reaping:
+        if time() - float(Timestamp(info['delete_timestamp'])) <= \
+                self.delay_reaping:
             return False
         account = info['account']
         self.logger.info(_('Beginning pass on account %s'), account)
-        self.stats_return_codes = {}
-        self.stats_containers_deleted = 0
-        self.stats_objects_deleted = 0
-        self.stats_containers_remaining = 0
-        self.stats_objects_remaining = 0
-        self.stats_containers_possibly_remaining = 0
-        self.stats_objects_possibly_remaining = 0
+        self.reset_stats()
+        container_limit = 1000
+        if container_shard is not None:
+            container_limit *= len(nodes)
         try:
             marker = ''
             while True:
                 containers = \
-                    list(broker.list_containers_iter(1000, marker, None, None,
-                                                     None))
+                    list(broker.list_containers_iter(container_limit, marker,
+                                                     None, None, None))
                 if not containers:
                     break
                 try:
                     for (container, _junk, _junk, _junk) in containers:
+                        this_shard = int(md5(container).hexdigest(), 16) % \
+                            len(nodes)
+                        if container_shard not in (this_shard, None):
+                            continue
+
                         self.container_pool.spawn(self.reap_container, account,
                                                   partition, nodes, container)
                     self.container_pool.waitall()
@@ -240,6 +281,8 @@ class AccountReaper(Daemon):
                     self.logger.exception(
                         _('Exception with containers for account %s'), account)
                 marker = containers[-1][0]
+                if marker == '':
+                    break
             log = 'Completed pass on account %s' % account
         except (Exception, Timeout):
             self.logger.exception(
@@ -262,12 +305,18 @@ class AccountReaper(Daemon):
                 self.stats_objects_possibly_remaining
         if self.stats_return_codes:
             log += _(', return codes: ')
-            for code in sorted(self.stats_return_codes.keys()):
+            for code in sorted(self.stats_return_codes):
                 log += '%s %sxxs, ' % (self.stats_return_codes[code], code)
             log = log[:-2]
         log += _(', elapsed: %.02fs') % (time() - begin)
         self.logger.info(log)
         self.logger.timing_since('timing', self.start_time)
+        delete_timestamp = Timestamp(info['delete_timestamp'])
+        if self.stats_containers_remaining and \
+           begin - float(delete_timestamp) >= self.reap_not_done_after:
+            self.logger.warning(
+                _('Account %(account)s has not been reaped since %(time)s') %
+                {'account': account, 'time': delete_timestamp.isoformat})
         return True
 
     def reap_container(self, account, account_partition, account_nodes,
@@ -314,30 +363,39 @@ class AccountReaper(Daemon):
         while True:
             objects = None
             try:
-                objects = direct_get_container(
+                headers, objects = direct_get_container(
                     node, part, account, container,
                     marker=marker,
                     conn_timeout=self.conn_timeout,
-                    response_timeout=self.node_timeout)[1]
+                    response_timeout=self.node_timeout)
                 self.stats_return_codes[2] = \
                     self.stats_return_codes.get(2, 0) + 1
                 self.logger.increment('return_codes.2')
-            except ClientException, err:
+            except ClientException as err:
                 if self.logger.getEffectiveLevel() <= DEBUG:
                     self.logger.exception(
                         _('Exception with %(ip)s:%(port)s/%(device)s'), node)
-                self.stats_return_codes[err.http_status / 100] = \
-                    self.stats_return_codes.get(err.http_status / 100, 0) + 1
+                self.stats_return_codes[err.http_status // 100] = \
+                    self.stats_return_codes.get(err.http_status // 100, 0) + 1
                 self.logger.increment(
-                    'return_codes.%d' % (err.http_status / 100,))
+                    'return_codes.%d' % (err.http_status // 100,))
+            except (Timeout, socket.error) as err:
+                self.logger.error(
+                    _('Timeout Exception with %(ip)s:%(port)s/%(device)s'),
+                    node)
             if not objects:
                 break
             try:
+                policy_index = headers.get('X-Backend-Storage-Policy-Index', 0)
+                policy = POLICIES.get_by_index(policy_index)
+                if not policy:
+                    self.logger.error('ERROR: invalid storage policy index: %r'
+                                      % policy_index)
                 for obj in objects:
-                    if isinstance(obj['name'], unicode):
+                    if isinstance(obj['name'], six.text_type):
                         obj['name'] = obj['name'].encode('utf8')
                     pool.spawn(self.reap_object, account, container, part,
-                               nodes, obj['name'])
+                               nodes, obj['name'], policy_index)
                 pool.waitall()
             except (Exception, Timeout):
                 self.logger.exception(_('Exception with objects for container '
@@ -346,8 +404,11 @@ class AccountReaper(Daemon):
                                       {'container': container,
                                        'account': account})
             marker = objects[-1]['name']
+            if marker == '':
+                break
         successes = 0
         failures = 0
+        timestamp = Timestamp(time())
         for node in nodes:
             anode = account_nodes.pop()
             try:
@@ -358,21 +419,28 @@ class AccountReaper(Daemon):
                     headers={'X-Account-Host': '%(ip)s:%(port)s' % anode,
                              'X-Account-Partition': str(account_partition),
                              'X-Account-Device': anode['device'],
-                             'X-Account-Override-Deleted': 'yes'})
+                             'X-Account-Override-Deleted': 'yes',
+                             'X-Timestamp': timestamp.internal})
                 successes += 1
                 self.stats_return_codes[2] = \
                     self.stats_return_codes.get(2, 0) + 1
                 self.logger.increment('return_codes.2')
-            except ClientException, err:
+            except ClientException as err:
                 if self.logger.getEffectiveLevel() <= DEBUG:
                     self.logger.exception(
                         _('Exception with %(ip)s:%(port)s/%(device)s'), node)
                 failures += 1
                 self.logger.increment('containers_failures')
-                self.stats_return_codes[err.http_status / 100] = \
-                    self.stats_return_codes.get(err.http_status / 100, 0) + 1
+                self.stats_return_codes[err.http_status // 100] = \
+                    self.stats_return_codes.get(err.http_status // 100, 0) + 1
                 self.logger.increment(
-                    'return_codes.%d' % (err.http_status / 100,))
+                    'return_codes.%d' % (err.http_status // 100,))
+            except (Timeout, socket.error) as err:
+                self.logger.error(
+                    _('Timeout Exception with %(ip)s:%(port)s/%(device)s'),
+                    node)
+                failures += 1
+                self.logger.increment('containers_failures')
         if successes > failures:
             self.stats_containers_deleted += 1
             self.logger.increment('containers_deleted')
@@ -384,7 +452,7 @@ class AccountReaper(Daemon):
             self.logger.increment('containers_possibly_remaining')
 
     def reap_object(self, account, container, container_partition,
-                    container_nodes, obj):
+                    container_nodes, obj, policy_index):
         """
         Deletes the given object by issuing a delete request to each node for
         the object. The format of the delete request is such that each object
@@ -400,16 +468,25 @@ class AccountReaper(Daemon):
                                     container ring.
         :param container_nodes: The primary node dicts for the container.
         :param obj: The name of the object to delete.
+        :param policy_index: The storage policy index of the object's container
 
         * See also: :func:`swift.common.ring.Ring.get_nodes` for a description
           of the container node dicts.
         """
-        container_nodes = list(container_nodes)
-        part, nodes = self.get_object_ring().get_nodes(account, container, obj)
+        cnodes = itertools.cycle(container_nodes)
+        try:
+            ring = self.get_object_ring(policy_index)
+        except PolicyError:
+            self.stats_objects_remaining += 1
+            self.logger.increment('objects_remaining')
+            return
+        part, nodes = ring.get_nodes(account, container, obj)
         successes = 0
         failures = 0
+        timestamp = Timestamp(time())
+
         for node in nodes:
-            cnode = container_nodes.pop()
+            cnode = next(cnodes)
             try:
                 direct_delete_object(
                     node, part, account, container, obj,
@@ -417,21 +494,29 @@ class AccountReaper(Daemon):
                     response_timeout=self.node_timeout,
                     headers={'X-Container-Host': '%(ip)s:%(port)s' % cnode,
                              'X-Container-Partition': str(container_partition),
-                             'X-Container-Device': cnode['device']})
+                             'X-Container-Device': cnode['device'],
+                             'X-Backend-Storage-Policy-Index': policy_index,
+                             'X-Timestamp': timestamp.internal})
                 successes += 1
                 self.stats_return_codes[2] = \
                     self.stats_return_codes.get(2, 0) + 1
                 self.logger.increment('return_codes.2')
-            except ClientException, err:
+            except ClientException as err:
                 if self.logger.getEffectiveLevel() <= DEBUG:
                     self.logger.exception(
                         _('Exception with %(ip)s:%(port)s/%(device)s'), node)
                 failures += 1
                 self.logger.increment('objects_failures')
-                self.stats_return_codes[err.http_status / 100] = \
-                    self.stats_return_codes.get(err.http_status / 100, 0) + 1
+                self.stats_return_codes[err.http_status // 100] = \
+                    self.stats_return_codes.get(err.http_status // 100, 0) + 1
                 self.logger.increment(
-                    'return_codes.%d' % (err.http_status / 100,))
+                    'return_codes.%d' % (err.http_status // 100,))
+            except (Timeout, socket.error) as err:
+                failures += 1
+                self.logger.increment('objects_failures')
+                self.logger.error(
+                    _('Timeout Exception with %(ip)s:%(port)s/%(device)s'),
+                    node)
             if successes > failures:
                 self.stats_objects_deleted += 1
                 self.logger.increment('objects_deleted')

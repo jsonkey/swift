@@ -1,4 +1,4 @@
-# Copyright (c) 2010-2012 OpenStack, LLC.
+# Copyright (c) 2010-2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,407 +15,205 @@
 
 """ Object Server for Swift """
 
-from __future__ import with_statement
-import cPickle as pickle
-import errno
+import six.moves.cPickle as pickle
+import json
 import os
+import multiprocessing
 import time
 import traceback
-from datetime import datetime
+import socket
+import math
+from swift import gettext_ as _
 from hashlib import md5
-from tempfile import mkstemp
-from urllib import unquote
-from contextlib import contextmanager
 
-from xattr import getxattr, setxattr
-from eventlet import sleep, Timeout, tpool
+from eventlet import sleep, wsgi, Timeout
+from eventlet.greenthread import spawn
 
-from swift.common.utils import mkdirs, normalize_timestamp, public, \
-    storage_directory, hash_path, renamer, fallocate, fsync, \
-    split_path, drop_buffer_cache, get_logger, write_pickle, \
-    config_true_value, validate_device_partition, timing_stats
+from swift.common.utils import public, get_logger, \
+    config_true_value, timing_stats, replication, \
+    normalize_delete_at_timestamp, get_log_line, Timestamp, \
+    get_expirer_container, parse_mime_headers, \
+    iter_multipart_mime_documents, extract_swift_bytes, safe_json_loads
 from swift.common.bufferedhttp import http_connect
-from swift.common.constraints import check_object_creation, check_mount, \
-    check_float, check_utf8
-from swift.common.exceptions import ConnectionTimeout, DiskFileError, \
-    DiskFileNotExist
-from swift.obj.replicator import tpool_reraise, invalidate_hash, \
-    quarantine_renamer, get_hashes
+from swift.common.constraints import check_object_creation, \
+    valid_timestamp, check_utf8
+from swift.common.exceptions import ConnectionTimeout, DiskFileQuarantined, \
+    DiskFileNotExist, DiskFileCollision, DiskFileNoSpace, DiskFileDeleted, \
+    DiskFileDeviceUnavailable, DiskFileExpired, ChunkReadTimeout, \
+    ChunkReadError, DiskFileXattrNotSupported
+from swift.obj import ssync_receiver
 from swift.common.http import is_success
+from swift.common.base_storage_server import BaseStorageServer
+from swift.common.header_key_dict import HeaderKeyDict
+from swift.common.request_helpers import get_name_and_placement, \
+    is_user_meta, is_sys_or_user_meta, is_object_transient_sysmeta, \
+    resolve_etag_is_at_header, is_sys_meta
 from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPCreated, \
-    HTTPInternalServerError, HTTPNoContent, HTTPNotFound, HTTPNotModified, \
+    HTTPInternalServerError, HTTPNoContent, HTTPNotFound, \
     HTTPPreconditionFailed, HTTPRequestTimeout, HTTPUnprocessableEntity, \
-    HTTPClientDisconnect, HTTPMethodNotAllowed, Request, Response, UTC, \
-    HTTPInsufficientStorage, multi_range_iterator
+    HTTPClientDisconnect, HTTPMethodNotAllowed, Request, Response, \
+    HTTPInsufficientStorage, HTTPForbidden, HTTPException, HTTPConflict, \
+    HTTPServerError
+from swift.obj.diskfile import DATAFILE_SYSTEM_META, DiskFileRouter
 
 
-DATADIR = 'objects'
-ASYNCDIR = 'async_pending'
-PICKLE_PROTOCOL = 2
-METADATA_KEY = 'user.swift.metadata'
-MAX_OBJECT_NAME_LENGTH = 1024
-# keep these lower-case
-DISALLOWED_HEADERS = set('content-length content-type deleted etag'.split())
+def iter_mime_headers_and_bodies(wsgi_input, mime_boundary, read_chunk_size):
+    mime_documents_iter = iter_multipart_mime_documents(
+        wsgi_input, mime_boundary, read_chunk_size)
+
+    for file_like in mime_documents_iter:
+        hdrs = parse_mime_headers(file_like)
+        yield (hdrs, file_like)
 
 
-def read_metadata(fd):
+def drain(file_like, read_size, timeout):
     """
-    Helper function to read the pickled metadata from an object file.
+    Read and discard any bytes from file_like.
 
-    :param fd: file descriptor to load the metadata from
+    :param file_like: file-like object to read from
+    :param read_size: how big a chunk to read at a time
+    :param timeout: how long to wait for a read (use None for no timeout)
 
-    :returns: dictionary of metadata
-    """
-    metadata = ''
-    key = 0
-    try:
-        while True:
-            metadata += getxattr(fd, '%s%s' % (METADATA_KEY, (key or '')))
-            key += 1
-    except IOError:
-        pass
-    return pickle.loads(metadata)
-
-
-def write_metadata(fd, metadata):
-    """
-    Helper function to write pickled metadata for an object file.
-
-    :param fd: file descriptor to write the metadata
-    :param metadata: metadata to write
-    """
-    metastr = pickle.dumps(metadata, PICKLE_PROTOCOL)
-    key = 0
-    while metastr:
-        setxattr(fd, '%s%s' % (METADATA_KEY, key or ''), metastr[:254])
-        metastr = metastr[254:]
-        key += 1
-
-
-class DiskFile(object):
-    """
-    Manage object files on disk.
-
-    :param path: path to devices on the node
-    :param device: device name
-    :param partition: partition on the device the object lives in
-    :param account: account name for the object
-    :param container: container name for the object
-    :param obj: object name for the object
-    :param keep_data_fp: if True, don't close the fp, otherwise close it
-    :param disk_chunk_size: size of chunks on file reads
-    :param iter_hook: called when __iter__ returns a chunk
+    :raises ChunkReadTimeout: if no chunk was read in time
     """
 
-    def __init__(self, path, device, partition, account, container, obj,
-                 logger, keep_data_fp=False, disk_chunk_size=65536,
-                 iter_hook=None):
-        self.disk_chunk_size = disk_chunk_size
-        self.iter_hook = iter_hook
-        self.name = '/' + '/'.join((account, container, obj))
-        name_hash = hash_path(account, container, obj)
-        self.datadir = os.path.join(
-            path, device, storage_directory(DATADIR, partition, name_hash))
-        self.device_path = os.path.join(path, device)
-        self.tmpdir = os.path.join(path, device, 'tmp')
-        self.logger = logger
-        self.metadata = {}
-        self.meta_file = None
-        self.data_file = None
-        self.fp = None
-        self.iter_etag = None
-        self.started_at_0 = False
-        self.read_to_eof = False
-        self.quarantined_dir = None
-        self.keep_cache = False
-        self.suppress_file_closing = False
-        if not os.path.exists(self.datadir):
-            return
-        files = sorted(os.listdir(self.datadir), reverse=True)
-        for file in files:
-            if file.endswith('.ts'):
-                self.data_file = self.meta_file = None
-                self.metadata = {'deleted': True}
-                return
-            if file.endswith('.meta') and not self.meta_file:
-                self.meta_file = os.path.join(self.datadir, file)
-            if file.endswith('.data') and not self.data_file:
-                self.data_file = os.path.join(self.datadir, file)
+    while True:
+        with ChunkReadTimeout(timeout):
+            chunk = file_like.read(read_size)
+            if not chunk:
                 break
-        if not self.data_file:
-            return
-        self.fp = open(self.data_file, 'rb')
-        self.metadata = read_metadata(self.fp)
-        if not keep_data_fp:
-            self.close(verify_file=False)
-        if self.meta_file:
-            with open(self.meta_file) as mfp:
-                for key in self.metadata.keys():
-                    if key.lower() not in DISALLOWED_HEADERS:
-                        del self.metadata[key]
-                self.metadata.update(read_metadata(mfp))
-
-    def __iter__(self):
-        """Returns an iterator over the data file."""
-        try:
-            dropped_cache = 0
-            read = 0
-            self.started_at_0 = False
-            self.read_to_eof = False
-            if self.fp.tell() == 0:
-                self.started_at_0 = True
-                self.iter_etag = md5()
-            while True:
-                chunk = self.fp.read(self.disk_chunk_size)
-                if chunk:
-                    if self.iter_etag:
-                        self.iter_etag.update(chunk)
-                    read += len(chunk)
-                    if read - dropped_cache > (1024 * 1024):
-                        self.drop_cache(self.fp.fileno(), dropped_cache,
-                                        read - dropped_cache)
-                        dropped_cache = read
-                    yield chunk
-                    if self.iter_hook:
-                        self.iter_hook()
-                else:
-                    self.read_to_eof = True
-                    self.drop_cache(self.fp.fileno(), dropped_cache,
-                                    read - dropped_cache)
-                    break
-        finally:
-            if not self.suppress_file_closing:
-                self.close()
-
-    def app_iter_range(self, start, stop):
-        """Returns an iterator over the data file for range (start, stop)"""
-        if start or start == 0:
-            self.fp.seek(start)
-        if stop is not None:
-            length = stop - start
-        else:
-            length = None
-        for chunk in self:
-            if length is not None:
-                length -= len(chunk)
-                if length < 0:
-                    # Chop off the extra:
-                    yield chunk[:length]
-                    break
-            yield chunk
-
-    def app_iter_ranges(self, ranges, content_type, boundary, size):
-        """Returns an iterator over the data file for a set of ranges"""
-        if (not ranges or len(ranges) == 0):
-            yield ''
-        else:
-            try:
-                self.suppress_file_closing = True
-                for chunk in multi_range_iterator(
-                        ranges, content_type, boundary, size,
-                        self.app_iter_range):
-                    yield chunk
-            finally:
-                self.suppress_file_closing = False
-                self.close()
-
-    def _handle_close_quarantine(self):
-        """Check if file needs to be quarantined"""
-        try:
-            obj_size = self.get_data_file_size()
-        except DiskFileError, e:
-            self.quarantine()
-            return
-        except DiskFileNotExist:
-            return
-
-        if self.iter_etag and self.started_at_0 and self.read_to_eof and \
-                'ETag' in self.metadata and \
-                self.iter_etag.hexdigest() != self.metadata.get('ETag'):
-            self.quarantine()
-
-    def close(self, verify_file=True):
-        """
-        Close the file. Will handle quarantining file if necessary.
-
-        :param verify_file: Defaults to True. If false, will not check
-                            file to see if it needs quarantining.
-        """
-        if self.fp:
-            try:
-                if verify_file:
-                    self._handle_close_quarantine()
-            except (Exception, Timeout), e:
-                self.logger.error(_(
-                    'ERROR DiskFile %(data_file)s in '
-                    '%(data_dir)s close failure: %(exc)s : %(stack)'),
-                    {'exc': e, 'stack': ''.join(traceback.format_stack()),
-                     'data_file': self.data_file, 'data_dir': self.datadir})
-            finally:
-                self.fp.close()
-                self.fp = None
-
-    def is_deleted(self):
-        """
-        Check if the file is deleted.
-
-        :returns: True if the file doesn't exist or has been flagged as
-                  deleted.
-        """
-        return not self.data_file or 'deleted' in self.metadata
-
-    def is_expired(self):
-        """
-        Check if the file is expired.
-
-        :returns: True if the file has an X-Delete-At in the past
-        """
-        return ('X-Delete-At' in self.metadata and
-                int(self.metadata['X-Delete-At']) <= time.time())
-
-    @contextmanager
-    def mkstemp(self):
-        """Contextmanager to make a temporary file."""
-        if not os.path.exists(self.tmpdir):
-            mkdirs(self.tmpdir)
-        fd, tmppath = mkstemp(dir=self.tmpdir)
-        try:
-            yield fd, tmppath
-        finally:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-            try:
-                os.unlink(tmppath)
-            except OSError:
-                pass
-
-    def put(self, fd, tmppath, metadata, extension='.data'):
-        """
-        Finalize writing the file on disk, and renames it from the temp file to
-        the real location.  This should be called after the data has been
-        written to the temp file.
-
-        :params fd: file descriptor of the temp file
-        :param tmppath: path to the temporary file being used
-        :param metadata: dictionary of metadata to be written
-        :param extension: extension to be used when making the file
-        """
-        metadata['name'] = self.name
-        timestamp = normalize_timestamp(metadata['X-Timestamp'])
-        write_metadata(fd, metadata)
-        if 'Content-Length' in metadata:
-            self.drop_cache(fd, 0, int(metadata['Content-Length']))
-        tpool.execute(fsync, fd)
-        invalidate_hash(os.path.dirname(self.datadir))
-        renamer(tmppath, os.path.join(self.datadir, timestamp + extension))
-        self.metadata = metadata
-
-    def unlinkold(self, timestamp):
-        """
-        Remove any older versions of the object file.  Any file that has an
-        older timestamp than timestamp will be deleted.
-
-        :param timestamp: timestamp to compare with each file
-        """
-        timestamp = normalize_timestamp(timestamp)
-        for fname in os.listdir(self.datadir):
-            if fname < timestamp:
-                try:
-                    os.unlink(os.path.join(self.datadir, fname))
-                except OSError, err:    # pragma: no cover
-                    if err.errno != errno.ENOENT:
-                        raise
-
-    def drop_cache(self, fd, offset, length):
-        """Method for no-oping buffer cache drop method."""
-        if not self.keep_cache:
-            drop_buffer_cache(fd, offset, length)
-
-    def quarantine(self):
-        """
-        In the case that a file is corrupted, move it to a quarantined
-        area to allow replication to fix it.
-
-        :returns: if quarantine is successful, path to quarantined
-                  directory otherwise None
-        """
-        if not (self.is_deleted() or self.quarantined_dir):
-            self.quarantined_dir = quarantine_renamer(self.device_path,
-                                                      self.data_file)
-            self.logger.increment('quarantines')
-            return self.quarantined_dir
-
-    def get_data_file_size(self):
-        """
-        Returns the os.path.getsize for the file.  Raises an exception if this
-        file does not match the Content-Length stored in the metadata. Or if
-        self.data_file does not exist.
-
-        :returns: file size as an int
-        :raises DiskFileError: on file size mismatch.
-        :raises DiskFileNotExist: on file not existing (including deleted)
-        """
-        try:
-            file_size = 0
-            if self.data_file:
-                file_size = os.path.getsize(self.data_file)
-                if 'Content-Length' in self.metadata:
-                    metadata_size = int(self.metadata['Content-Length'])
-                    if file_size != metadata_size:
-                        raise DiskFileError(
-                            'Content-Length of %s does not match file size '
-                            'of %s' % (metadata_size, file_size))
-                return file_size
-        except OSError, err:
-            if err.errno != errno.ENOENT:
-                raise
-        raise DiskFileNotExist('Data File does not exist.')
 
 
-class ObjectController(object):
+def _make_backend_fragments_header(fragments):
+    if fragments:
+        result = {}
+        for ts, frag_list in fragments.items():
+            result[ts.internal] = frag_list
+        return json.dumps(result)
+    return None
+
+
+class EventletPlungerString(str):
+    """
+    Eventlet won't send headers until it's accumulated at least
+    eventlet.wsgi.MINIMUM_CHUNK_SIZE bytes or the app iter is exhausted. If we
+    want to send the response body behind Eventlet's back, perhaps with some
+    zero-copy wizardry, then we have to unclog the plumbing in eventlet.wsgi
+    to force the headers out, so we use an EventletPlungerString to empty out
+    all of Eventlet's buffers.
+    """
+    def __len__(self):
+        return wsgi.MINIMUM_CHUNK_SIZE + 1
+
+
+class ObjectController(BaseStorageServer):
     """Implements the WSGI application for the Swift Object Server."""
 
-    def __init__(self, conf):
+    server_type = 'object-server'
+
+    def __init__(self, conf, logger=None):
         """
         Creates a new WSGI application for the Swift Object Server. An
         example configuration is given at
         <source-dir>/etc/object-server.conf-sample or
         /etc/swift/object-server.conf-sample.
         """
-        self.logger = get_logger(conf, log_route='object-server')
-        self.devices = conf.get('devices', '/srv/node/')
-        self.mount_check = config_true_value(conf.get('mount_check', 'true'))
-        self.node_timeout = int(conf.get('node_timeout', 3))
+        super(ObjectController, self).__init__(conf)
+        self.logger = logger or get_logger(conf, log_route='object-server')
+        self.node_timeout = float(conf.get('node_timeout', 3))
+        self.container_update_timeout = float(
+            conf.get('container_update_timeout', 1))
         self.conn_timeout = float(conf.get('conn_timeout', 0.5))
+        self.client_timeout = int(conf.get('client_timeout', 60))
         self.disk_chunk_size = int(conf.get('disk_chunk_size', 65536))
         self.network_chunk_size = int(conf.get('network_chunk_size', 65536))
-        self.keep_cache_size = int(conf.get('keep_cache_size', 5242880))
-        self.keep_cache_private = \
-            config_true_value(conf.get('keep_cache_private', 'false'))
         self.log_requests = config_true_value(conf.get('log_requests', 'true'))
         self.max_upload_time = int(conf.get('max_upload_time', 86400))
         self.slow = int(conf.get('slow', 0))
-        self.bytes_per_sync = int(conf.get('mb_per_sync', 512)) * 1024 * 1024
+        self.keep_cache_private = \
+            config_true_value(conf.get('keep_cache_private', 'false'))
+
         default_allowed_headers = '''
             content-disposition,
             content-encoding,
             x-delete-at,
             x-object-manifest,
+            x-static-large-object,
         '''
-        self.allowed_headers = set(
-            i.strip().lower() for i in
-            conf.get('allowed_headers', default_allowed_headers).split(',')
-            if i.strip() and i.strip().lower() not in DISALLOWED_HEADERS)
-        self.expiring_objects_account = \
-            (conf.get('auto_create_account_prefix') or '.') + \
-            'expiring_objects'
+        extra_allowed_headers = [
+            header.strip().lower() for header in conf.get(
+                'allowed_headers', default_allowed_headers).split(',')
+            if header.strip()
+        ]
+        self.allowed_headers = set()
+        for header in extra_allowed_headers:
+            if header not in DATAFILE_SYSTEM_META:
+                self.allowed_headers.add(header)
+        self.auto_create_account_prefix = \
+            conf.get('auto_create_account_prefix') or '.'
+        self.expiring_objects_account = self.auto_create_account_prefix + \
+            (conf.get('expiring_objects_account_name') or 'expiring_objects')
         self.expiring_objects_container_divisor = \
             int(conf.get('expiring_objects_container_divisor') or 86400)
+        # Initialization was successful, so now apply the network chunk size
+        # parameter as the default read / write buffer size for the network
+        # sockets.
+        #
+        # NOTE WELL: This is a class setting, so until we get set this on a
+        # per-connection basis, this affects reading and writing on ALL
+        # sockets, those between the proxy servers and external clients, and
+        # those between the proxy servers and the other internal servers.
+        #
+        # ** Because the primary motivation for this is to optimize how data
+        # is written back to the proxy server, we could use the value from the
+        # disk_chunk_size parameter. However, it affects all created sockets
+        # using this class so we have chosen to tie it to the
+        # network_chunk_size parameter value instead.
+        socket._fileobject.default_bufsize = self.network_chunk_size
+
+        # Provide further setup specific to an object server implementation.
+        self.setup(conf)
+
+    def setup(self, conf):
+        """
+        Implementation specific setup. This method is called at the very end
+        by the constructor to allow a specific implementation to modify
+        existing attributes or add its own attributes.
+
+        :param conf: WSGI configuration parameter
+        """
+
+        # Common on-disk hierarchy shared across account, container and object
+        # servers.
+        self._diskfile_router = DiskFileRouter(conf, self.logger)
+        # This is populated by global_conf_callback way below as the semaphore
+        # is shared by all workers.
+        if 'replication_semaphore' in conf:
+            # The value was put in a list so it could get past paste
+            self.replication_semaphore = conf['replication_semaphore'][0]
+        else:
+            self.replication_semaphore = None
+        self.replication_failure_threshold = int(
+            conf.get('replication_failure_threshold') or 100)
+        self.replication_failure_ratio = float(
+            conf.get('replication_failure_ratio') or 1.0)
+
+    def get_diskfile(self, device, partition, account, container, obj,
+                     policy, **kwargs):
+        """
+        Utility method for instantiating a DiskFile object supporting a given
+        REST API.
+
+        An implementation of the object server that wants to use a different
+        DiskFile class would simply over-ride this method to provide that
+        behavior.
+        """
+        return self._diskfile_router[policy].get_diskfile(
+            device, partition, account, container, obj, policy, **kwargs)
 
     def async_update(self, op, account, container, obj, host, partition,
-                     contdevice, headers_out, objdevice):
+                     contdevice, headers_out, objdevice, policy,
+                     logger_thread_locals=None):
         """
         Sends or saves an async update.
 
@@ -429,7 +227,14 @@ class ObjectController(object):
         :param headers_out: dictionary of headers to send in the container
                             request
         :param objdevice: device name that the object is in
+        :param policy: the associated BaseStoragePolicy instance
+        :param logger_thread_locals: The thread local values to be set on the
+                                     self.logger to retain transaction
+                                     logging information.
         """
+        if logger_thread_locals:
+            self.logger.thread_locals = logger_thread_locals
+        headers_out['user-agent'] = 'object-server %s' % os.getpid()
         full_path = '/%s/%s/%s' % (account, container, obj)
         if all([host, partition, contdevice]):
             try:
@@ -454,18 +259,15 @@ class ObjectController(object):
                     'ERROR container update failed with '
                     '%(ip)s:%(port)s/%(dev)s (saving for async update later)'),
                     {'ip': ip, 'port': port, 'dev': contdevice})
-        async_dir = os.path.join(self.devices, objdevice, ASYNCDIR)
-        ohash = hash_path(account, container, obj)
-        self.logger.increment('async_pendings')
-        write_pickle(
-            {'op': op, 'account': account, 'container': container,
-             'obj': obj, 'headers': headers_out},
-            os.path.join(async_dir, ohash[-3:], ohash + '-' +
-                         normalize_timestamp(headers_out['x-timestamp'])),
-            os.path.join(self.devices, objdevice, 'tmp'))
+        data = {'op': op, 'account': account, 'container': container,
+                'obj': obj, 'headers': headers_out}
+        timestamp = headers_out.get('x-meta-timestamp',
+                                    headers_out.get('x-timestamp'))
+        self._diskfile_router[policy].pickle_async_update(
+            objdevice, account, container, obj, data, timestamp, policy)
 
-    def container_update(self, op, account, container, obj, headers_in,
-                         headers_out, objdevice):
+    def container_update(self, op, account, container, obj, request,
+                         headers_out, objdevice, policy):
         """
         Update the container when objects are updated.
 
@@ -473,119 +275,377 @@ class ObjectController(object):
         :param account: account name for the object
         :param container: container name for the object
         :param obj: object name
-        :param headers_in: dictionary of headers from the original request
+        :param request: the original request object driving the update
         :param headers_out: dictionary of headers to send in the container
-                            request
+                            request(s)
         :param objdevice: device name that the object is in
+        :param policy:  the BaseStoragePolicy instance
         """
-        host = headers_in.get('X-Container-Host', None)
-        partition = headers_in.get('X-Container-Partition', None)
-        contdevice = headers_in.get('X-Container-Device', None)
-        if not all([host, partition, contdevice]):
+        headers_in = request.headers
+        conthosts = [h.strip() for h in
+                     headers_in.get('X-Container-Host', '').split(',')]
+        contdevices = [d.strip() for d in
+                       headers_in.get('X-Container-Device', '').split(',')]
+        contpartition = headers_in.get('X-Container-Partition', '')
+
+        if len(conthosts) != len(contdevices):
+            # This shouldn't happen unless there's a bug in the proxy,
+            # but if there is, we want to know about it.
+            self.logger.error(_(
+                'ERROR Container update failed: different '
+                'numbers of hosts and devices in request: '
+                '"%(hosts)s" vs "%(devices)s"') % {
+                    'hosts': headers_in.get('X-Container-Host', ''),
+                    'devices': headers_in.get('X-Container-Device', '')})
             return
-        self.async_update(op, account, container, obj, host, partition,
-                          contdevice, headers_out, objdevice)
+
+        if contpartition:
+            updates = zip(conthosts, contdevices)
+        else:
+            updates = []
+
+        headers_out['x-trans-id'] = headers_in.get('x-trans-id', '-')
+        headers_out['referer'] = request.as_referer()
+        headers_out['X-Backend-Storage-Policy-Index'] = int(policy)
+        update_greenthreads = []
+        for conthost, contdevice in updates:
+            gt = spawn(self.async_update, op, account, container, obj,
+                       conthost, contpartition, contdevice, headers_out,
+                       objdevice, policy,
+                       logger_thread_locals=self.logger.thread_locals)
+            update_greenthreads.append(gt)
+        # Wait a little bit to see if the container updates are successful.
+        # If we immediately return after firing off the greenthread above, then
+        # we're more likely to confuse the end-user who does a listing right
+        # after getting a successful response to the object create. The
+        # `container_update_timeout` bounds the length of time we wait so that
+        # one slow container server doesn't make the entire request lag.
+        try:
+            with Timeout(self.container_update_timeout):
+                for gt in update_greenthreads:
+                    gt.wait()
+        except Timeout:
+            # updates didn't go through, log it and return
+            self.logger.debug(
+                'Container update timeout (%.4fs) waiting for %s',
+                self.container_update_timeout, updates)
 
     def delete_at_update(self, op, delete_at, account, container, obj,
-                         headers_in, objdevice):
+                         request, objdevice, policy):
         """
         Update the expiring objects container when objects are updated.
 
         :param op: operation performed (ex: 'PUT', or 'DELETE')
+        :param delete_at: scheduled delete in UNIX seconds, int
         :param account: account name for the object
         :param container: container name for the object
         :param obj: object name
-        :param headers_in: dictionary of headers from the original request
+        :param request: the original request driving the update
         :param objdevice: device name that the object is in
+        :param policy: the BaseStoragePolicy instance (used for tmp dir)
         """
-        # Quick cap that will work from now until Sat Nov 20 17:46:39 2286
-        # At that time, Swift will be so popular and pervasive I will have
-        # created income for thousands of future programmers.
-        delete_at = max(min(delete_at, 9999999999), 0)
-        host = partition = contdevice = None
-        headers_out = {'x-timestamp': headers_in['x-timestamp'],
-                       'x-trans-id': headers_in.get('x-trans-id', '-')}
+        if config_true_value(
+                request.headers.get('x-backend-replication', 'f')):
+            return
+        delete_at = normalize_delete_at_timestamp(delete_at)
+        updates = [(None, None)]
+
+        partition = None
+        hosts = contdevices = [None]
+        headers_in = request.headers
+        headers_out = HeaderKeyDict({
+            # system accounts are always Policy-0
+            'X-Backend-Storage-Policy-Index': 0,
+            'x-timestamp': request.timestamp.internal,
+            'x-trans-id': headers_in.get('x-trans-id', '-'),
+            'referer': request.as_referer()})
         if op != 'DELETE':
-            host = headers_in.get('X-Delete-At-Host', None)
+            delete_at_container = headers_in.get('X-Delete-At-Container', None)
+            if not delete_at_container:
+                self.logger.warning(
+                    'X-Delete-At-Container header must be specified for '
+                    'expiring objects background %s to work properly. Making '
+                    'best guess as to the container name for now.' % op)
+                # TODO(gholt): In a future release, change the above warning to
+                # a raised exception and remove the guess code below.
+                delete_at_container = get_expirer_container(
+                    delete_at, self.expiring_objects_container_divisor,
+                    account, container, obj)
             partition = headers_in.get('X-Delete-At-Partition', None)
-            contdevice = headers_in.get('X-Delete-At-Device', None)
+            hosts = headers_in.get('X-Delete-At-Host', '')
+            contdevices = headers_in.get('X-Delete-At-Device', '')
+            updates = [upd for upd in
+                       zip((h.strip() for h in hosts.split(',')),
+                           (c.strip() for c in contdevices.split(',')))
+                       if all(upd) and partition]
+            if not updates:
+                updates = [(None, None)]
             headers_out['x-size'] = '0'
             headers_out['x-content-type'] = 'text/plain'
             headers_out['x-etag'] = 'd41d8cd98f00b204e9800998ecf8427e'
-        self.async_update(
-            op, self.expiring_objects_account,
-            str(delete_at / self.expiring_objects_container_divisor *
-                self.expiring_objects_container_divisor),
-            '%s-%s/%s/%s' % (delete_at, account, container, obj),
-            host, partition, contdevice, headers_out, objdevice)
+        else:
+            # DELETEs of old expiration data have no way of knowing what the
+            # old X-Delete-At-Container was at the time of the initial setting
+            # of the data, so a best guess is made here.
+            # Worst case is a DELETE is issued now for something that doesn't
+            # exist there and the original data is left where it is, where
+            # it will be ignored when the expirer eventually tries to issue the
+            # object DELETE later since the X-Delete-At value won't match up.
+            delete_at_container = get_expirer_container(
+                delete_at, self.expiring_objects_container_divisor,
+                account, container, obj)
+        delete_at_container = normalize_delete_at_timestamp(
+            delete_at_container)
+
+        for host, contdevice in updates:
+            self.async_update(
+                op, self.expiring_objects_account, delete_at_container,
+                '%s-%s/%s/%s' % (delete_at, account, container, obj),
+                host, partition, contdevice, headers_out, objdevice,
+                policy)
+
+    def _make_timeout_reader(self, file_like):
+        def timeout_reader():
+            with ChunkReadTimeout(self.client_timeout):
+                return file_like.read(self.network_chunk_size)
+        return timeout_reader
+
+    def _read_put_commit_message(self, mime_documents_iter):
+        rcvd_commit = False
+        try:
+            with ChunkReadTimeout(self.client_timeout):
+                commit_hdrs, commit_iter = next(mime_documents_iter)
+                if commit_hdrs.get('X-Document', None) == "put commit":
+                    rcvd_commit = True
+            drain(commit_iter, self.network_chunk_size, self.client_timeout)
+        except ChunkReadError:
+            raise HTTPClientDisconnect()
+        except ChunkReadTimeout:
+            raise HTTPRequestTimeout()
+        except StopIteration:
+            raise HTTPBadRequest(body="couldn't find PUT commit MIME doc")
+        return rcvd_commit
+
+    def _read_metadata_footer(self, mime_documents_iter):
+        try:
+            with ChunkReadTimeout(self.client_timeout):
+                footer_hdrs, footer_iter = next(mime_documents_iter)
+        except ChunkReadError:
+            raise HTTPClientDisconnect()
+        except ChunkReadTimeout:
+            raise HTTPRequestTimeout()
+        except StopIteration:
+            raise HTTPBadRequest(body="couldn't find footer MIME doc")
+
+        timeout_reader = self._make_timeout_reader(footer_iter)
+        try:
+            footer_body = ''.join(iter(timeout_reader, ''))
+        except ChunkReadError:
+            raise HTTPClientDisconnect()
+        except ChunkReadTimeout:
+            raise HTTPRequestTimeout()
+
+        footer_md5 = footer_hdrs.get('Content-MD5')
+        if not footer_md5:
+            raise HTTPBadRequest(body="no Content-MD5 in footer")
+        if footer_md5 != md5(footer_body).hexdigest():
+            raise HTTPUnprocessableEntity(body="footer MD5 mismatch")
+
+        try:
+            return HeaderKeyDict(json.loads(footer_body))
+        except ValueError:
+            raise HTTPBadRequest("invalid JSON for footer doc")
+
+    def _check_container_override(self, update_headers, metadata,
+                                  footers=None):
+        """
+        Applies any overrides to the container update headers.
+
+        Overrides may be in the x-object-sysmeta-container-update- namespace or
+        the x-backend-container-update-override- namespace. The former is
+        preferred and is used by proxy middlewares. The latter is historical
+        but is still used with EC policy PUT requests; for backwards
+        compatibility the header names used with EC policy requests have not
+        been changed to the sysmeta namespace - that way the EC PUT path of a
+        newer proxy will remain compatible with an object server that pre-dates
+        the introduction of the x-object-sysmeta-container-update- namespace
+        and vice-versa.
+
+        :param update_headers: a dict of headers used in the container update
+        :param metadata: a dict that may container override items
+        :param footers: another dict that may container override items, at a
+                        higher priority than metadata
+        """
+        footers = footers or {}
+        # the order of this list is significant:
+        # x-object-sysmeta-container-update-override-* headers take precedence
+        # over x-backend-container-update-override-* headers
+        override_prefixes = ['x-backend-container-update-override-',
+                             'x-object-sysmeta-container-update-override-']
+        for override_prefix in override_prefixes:
+            for key, val in metadata.items():
+                if key.lower().startswith(override_prefix):
+                    override = key.lower().replace(override_prefix, 'x-')
+                    update_headers[override] = val
+            # apply x-backend-container-update-override* from footers *before*
+            # x-object-sysmeta-container-update-override-* from headers
+            for key, val in footers.items():
+                if key.lower().startswith(override_prefix):
+                    override = key.lower().replace(override_prefix, 'x-')
+                    update_headers[override] = val
+
+    def _preserve_slo_manifest(self, update_metadata, orig_metadata):
+        if 'X-Static-Large-Object' in orig_metadata:
+            update_metadata['X-Static-Large-Object'] = \
+                orig_metadata['X-Static-Large-Object']
 
     @public
-    @timing_stats
+    @timing_stats()
     def POST(self, request):
         """Handle HTTP POST requests for the Swift Object Server."""
-        try:
-            device, partition, account, container, obj = \
-                split_path(unquote(request.path), 5, 5, True)
-            validate_device_partition(device, partition)
-        except ValueError, err:
-            return HTTPBadRequest(body=str(err), request=request,
-                                  content_type='text/plain')
-        if 'x-timestamp' not in request.headers or \
-                not check_float(request.headers['x-timestamp']):
-            return HTTPBadRequest(body='Missing timestamp', request=request,
-                                  content_type='text/plain')
+        device, partition, account, container, obj, policy = \
+            get_name_and_placement(request, 5, 5, True)
+        req_timestamp = valid_timestamp(request)
         new_delete_at = int(request.headers.get('X-Delete-At') or 0)
         if new_delete_at and new_delete_at < time.time():
             return HTTPBadRequest(body='X-Delete-At in past', request=request,
                                   content_type='text/plain')
-        if self.mount_check and not check_mount(self.devices, device):
-            return HTTPInsufficientStorage(drive=device, request=request)
-        file = DiskFile(self.devices, device, partition, account, container,
-                        obj, self.logger, disk_chunk_size=self.disk_chunk_size)
-
-        if file.is_deleted() or file.is_expired():
-            return HTTPNotFound(request=request)
         try:
-            file_size = file.get_data_file_size()
-        except (DiskFileError, DiskFileNotExist):
-            file.quarantine()
+            disk_file = self.get_diskfile(
+                device, partition, account, container, obj,
+                policy=policy)
+        except DiskFileDeviceUnavailable:
+            return HTTPInsufficientStorage(drive=device, request=request)
+        try:
+            orig_metadata = disk_file.read_metadata()
+        except DiskFileXattrNotSupported:
+            return HTTPInsufficientStorage(drive=device, request=request)
+        except (DiskFileNotExist, DiskFileQuarantined):
             return HTTPNotFound(request=request)
-        metadata = {'X-Timestamp': request.headers['x-timestamp']}
-        metadata.update(val for val in request.headers.iteritems()
-                        if val[0].lower().startswith('x-object-meta-'))
-        for header_key in self.allowed_headers:
-            if header_key in request.headers:
-                header_caps = header_key.title()
-                metadata[header_caps] = request.headers[header_key]
-        old_delete_at = int(file.metadata.get('X-Delete-At') or 0)
-        if old_delete_at != new_delete_at:
-            if new_delete_at:
-                self.delete_at_update('PUT', new_delete_at, account, container,
-                                      obj, request.headers, device)
-            if old_delete_at:
-                self.delete_at_update('DELETE', old_delete_at, account,
-                                      container, obj, request.headers, device)
-        with file.mkstemp() as (fd, tmppath):
-            file.put(fd, tmppath, metadata, extension='.meta')
-        return HTTPAccepted(request=request)
+        orig_timestamp = Timestamp(orig_metadata.get('X-Timestamp', 0))
+        orig_ctype_timestamp = disk_file.content_type_timestamp
+        req_ctype_time = '0'
+        req_ctype = request.headers.get('Content-Type')
+        if req_ctype:
+            req_ctype_time = request.headers.get('Content-Type-Timestamp',
+                                                 req_timestamp.internal)
+        req_ctype_timestamp = Timestamp(req_ctype_time)
+        if orig_timestamp >= req_timestamp \
+                and orig_ctype_timestamp >= req_ctype_timestamp:
+            return HTTPConflict(
+                request=request,
+                headers={'X-Backend-Timestamp': orig_timestamp.internal})
+
+        if req_timestamp > orig_timestamp:
+            metadata = {'X-Timestamp': req_timestamp.internal}
+            self._preserve_slo_manifest(metadata, orig_metadata)
+            metadata.update(val for val in request.headers.items()
+                            if (is_user_meta('object', val[0]) or
+                                is_object_transient_sysmeta(val[0])))
+            headers_to_copy = (
+                request.headers.get(
+                    'X-Backend-Replication-Headers', '').split() +
+                list(self.allowed_headers))
+            for header_key in headers_to_copy:
+                if header_key in request.headers:
+                    header_caps = header_key.title()
+                    metadata[header_caps] = request.headers[header_key]
+            orig_delete_at = int(orig_metadata.get('X-Delete-At') or 0)
+            if orig_delete_at != new_delete_at:
+                if new_delete_at:
+                    self.delete_at_update(
+                        'PUT', new_delete_at, account, container, obj, request,
+                        device, policy)
+                if orig_delete_at:
+                    self.delete_at_update('DELETE', orig_delete_at, account,
+                                          container, obj, request, device,
+                                          policy)
+        else:
+            # preserve existing metadata, only content-type may be updated
+            metadata = dict(disk_file.get_metafile_metadata())
+
+        if req_ctype_timestamp > orig_ctype_timestamp:
+            # we have a new content-type, add to metadata and container update
+            content_type_headers = {
+                'Content-Type': request.headers['Content-Type'],
+                'Content-Type-Timestamp': req_ctype_timestamp.internal
+            }
+            metadata.update(content_type_headers)
+        else:
+            # send existing content-type with container update
+            content_type_headers = {
+                'Content-Type': disk_file.content_type,
+                'Content-Type-Timestamp': orig_ctype_timestamp.internal
+            }
+            if orig_ctype_timestamp != disk_file.data_timestamp:
+                # only add to metadata if it's not the datafile content-type
+                metadata.update(content_type_headers)
+
+        try:
+            disk_file.write_metadata(metadata)
+        except (DiskFileXattrNotSupported, DiskFileNoSpace):
+            return HTTPInsufficientStorage(drive=device, request=request)
+
+        if (content_type_headers['Content-Type-Timestamp']
+                != disk_file.data_timestamp):
+            # Current content-type is not from the datafile, but the datafile
+            # content-type may have a swift_bytes param that was appended by
+            # SLO and we must continue to send that with the container update.
+            # Do this (rather than use a separate header) for backwards
+            # compatibility because there may be 'legacy' container updates in
+            # async pending that have content-types with swift_bytes params, so
+            # we have to be able to handle those in container server anyway.
+            _, swift_bytes = extract_swift_bytes(
+                disk_file.get_datafile_metadata()['Content-Type'])
+            if swift_bytes:
+                content_type_headers['Content-Type'] += (';swift_bytes=%s'
+                                                         % swift_bytes)
+
+        update_headers = HeaderKeyDict({
+            'x-size': orig_metadata['Content-Length'],
+            'x-content-type': content_type_headers['Content-Type'],
+            'x-timestamp': disk_file.data_timestamp.internal,
+            'x-content-type-timestamp':
+            content_type_headers['Content-Type-Timestamp'],
+            'x-meta-timestamp': metadata['X-Timestamp'],
+            'x-etag': orig_metadata['ETag']})
+
+        # Special cases for backwards compatibility.
+        # For EC policy, send X-Object-Sysmeta-Ec-Etag which is same as the
+        # X-Backend-Container-Update-Override-Etag value sent with the original
+        # PUT. Similarly send X-Object-Sysmeta-Ec-Content-Length which is the
+        # same as the X-Backend-Container-Update-Override-Size value. We have
+        # to send Etag and size with a POST container update because the
+        # original PUT container update may have failed or be in async_pending.
+        if 'X-Object-Sysmeta-Ec-Etag' in orig_metadata:
+            update_headers['X-Etag'] = orig_metadata[
+                'X-Object-Sysmeta-Ec-Etag']
+        if 'X-Object-Sysmeta-Ec-Content-Length' in orig_metadata:
+            update_headers['X-Size'] = orig_metadata[
+                'X-Object-Sysmeta-Ec-Content-Length']
+
+        self._check_container_override(update_headers, orig_metadata)
+
+        # object POST updates are PUT to the container server
+        self.container_update(
+            'PUT', account, container, obj, request, update_headers,
+            device, policy)
+
+        # Add sysmeta to response
+        resp_headers = {}
+        for key, value in orig_metadata.items():
+            if is_sys_meta('object', key):
+                resp_headers[key] = value
+
+        return HTTPAccepted(request=request, headers=resp_headers)
 
     @public
-    @timing_stats
+    @timing_stats()
     def PUT(self, request):
         """Handle HTTP PUT requests for the Swift Object Server."""
-        try:
-            device, partition, account, container, obj = \
-                split_path(unquote(request.path), 5, 5, True)
-            validate_device_partition(device, partition)
-        except ValueError, err:
-            return HTTPBadRequest(body=str(err), request=request,
-                                  content_type='text/plain')
-        if self.mount_check and not check_mount(self.devices, device):
-            return HTTPInsufficientStorage(drive=device, request=request)
-        if 'x-timestamp' not in request.headers or \
-                not check_float(request.headers['x-timestamp']):
-            return HTTPBadRequest(body='Missing timestamp', request=request,
-                                  content_type='text/plain')
+        device, partition, account, container, obj, policy = \
+            get_name_and_placement(request, 5, 5, True)
+        req_timestamp = valid_timestamp(request)
         error_response = check_object_creation(request, obj)
         if error_response:
             return error_response
@@ -593,273 +653,437 @@ class ObjectController(object):
         if new_delete_at and new_delete_at < time.time():
             return HTTPBadRequest(body='X-Delete-At in past', request=request,
                                   content_type='text/plain')
-        file = DiskFile(self.devices, device, partition, account, container,
-                        obj, self.logger, disk_chunk_size=self.disk_chunk_size)
-        orig_timestamp = file.metadata.get('X-Timestamp')
+        try:
+            fsize = request.message_length()
+        except ValueError as e:
+            return HTTPBadRequest(body=str(e), request=request,
+                                  content_type='text/plain')
+
+        # In case of multipart-MIME put, the proxy sends a chunked request,
+        # but may let us know the real content length so we can verify that
+        # we have enough disk space to hold the object.
+        if fsize is None:
+            fsize = request.headers.get('X-Backend-Obj-Content-Length')
+            if fsize is not None:
+                try:
+                    fsize = int(fsize)
+                except ValueError as e:
+                    return HTTPBadRequest(body=str(e), request=request,
+                                          content_type='text/plain')
+        # SSYNC will include Frag-Index header for subrequests to primary
+        # nodes; handoff nodes should 409 subrequests to over-write an
+        # existing data fragment until they offloaded the existing fragment
+        frag_index = request.headers.get('X-Backend-Ssync-Frag-Index')
+        try:
+            disk_file = self.get_diskfile(
+                device, partition, account, container, obj,
+                policy=policy, frag_index=frag_index)
+        except DiskFileDeviceUnavailable:
+            return HTTPInsufficientStorage(drive=device, request=request)
+        try:
+            orig_metadata = disk_file.read_metadata()
+            orig_timestamp = disk_file.data_timestamp
+        except DiskFileXattrNotSupported:
+            return HTTPInsufficientStorage(drive=device, request=request)
+        except DiskFileDeleted as e:
+            orig_metadata = {}
+            orig_timestamp = e.timestamp
+        except (DiskFileNotExist, DiskFileQuarantined):
+            orig_metadata = {}
+            orig_timestamp = Timestamp(0)
+
+        # Checks for If-None-Match
+        if request.if_none_match is not None and orig_metadata:
+            if '*' in request.if_none_match:
+                # File exists already so return 412
+                return HTTPPreconditionFailed(request=request)
+            if orig_metadata.get('ETag') in request.if_none_match:
+                # The current ETag matches, so return 412
+                return HTTPPreconditionFailed(request=request)
+
+        if orig_timestamp >= req_timestamp:
+            return HTTPConflict(
+                request=request,
+                headers={'X-Backend-Timestamp': orig_timestamp.internal})
+        orig_delete_at = int(orig_metadata.get('X-Delete-At') or 0)
         upload_expiration = time.time() + self.max_upload_time
         etag = md5()
-        upload_size = 0
-        last_sync = 0
-        with file.mkstemp() as (fd, tmppath):
-            if 'content-length' in request.headers:
-                try:
-                    fallocate(fd, int(request.headers['content-length']))
-                except OSError:
-                    return HTTPInsufficientStorage(drive=device,
-                                                   request=request)
-            reader = request.environ['wsgi.input'].read
-            for chunk in iter(lambda: reader(self.network_chunk_size), ''):
-                upload_size += len(chunk)
-                if time.time() > upload_expiration:
-                    self.logger.increment('PUT.timeouts')
-                    return HTTPRequestTimeout(request=request)
-                etag.update(chunk)
-                while chunk:
-                    written = os.write(fd, chunk)
-                    chunk = chunk[written:]
-                # For large files sync every 512MB (by default) written
-                if upload_size - last_sync >= self.bytes_per_sync:
-                    tpool.execute(fsync, fd)
-                    drop_buffer_cache(fd, last_sync, upload_size - last_sync)
-                    last_sync = upload_size
-                sleep()
+        elapsed_time = 0
+        try:
+            with disk_file.create(size=fsize) as writer:
+                upload_size = 0
 
-            if 'content-length' in request.headers and \
-                    int(request.headers['content-length']) != upload_size:
-                return HTTPClientDisconnect(request=request)
-            etag = etag.hexdigest()
-            if 'etag' in request.headers and \
-                    request.headers['etag'].lower() != etag:
-                return HTTPUnprocessableEntity(request=request)
-            metadata = {
-                'X-Timestamp': request.headers['x-timestamp'],
-                'Content-Type': request.headers['content-type'],
-                'ETag': etag,
-                'Content-Length': str(upload_size),
-            }
-            metadata.update(val for val in request.headers.iteritems()
-                            if val[0].lower().startswith('x-object-meta-') and
-                            len(val[0]) > 14)
-            for header_key in self.allowed_headers:
-                if header_key in request.headers:
-                    header_caps = header_key.title()
-                    metadata[header_caps] = request.headers[header_key]
-            old_delete_at = int(file.metadata.get('X-Delete-At') or 0)
-            if old_delete_at != new_delete_at:
-                if new_delete_at:
-                    self.delete_at_update(
-                        'PUT', new_delete_at, account, container, obj,
-                        request.headers, device)
-                if old_delete_at:
-                    self.delete_at_update(
-                        'DELETE', old_delete_at, account, container, obj,
-                        request.headers, device)
-            file.put(fd, tmppath, metadata)
-        file.unlinkold(metadata['X-Timestamp'])
-        if not orig_timestamp or \
-                orig_timestamp < request.headers['x-timestamp']:
-            self.container_update(
-                'PUT', account, container, obj, request.headers,
-                {'x-size': file.metadata['Content-Length'],
-                 'x-content-type': file.metadata['Content-Type'],
-                 'x-timestamp': file.metadata['X-Timestamp'],
-                 'x-etag': file.metadata['ETag'],
-                 'x-trans-id': request.headers.get('x-trans-id', '-')},
-                device)
-        resp = HTTPCreated(request=request, etag=etag)
+                # If the proxy wants to send us object metadata after the
+                # object body, it sets some headers. We have to tell the
+                # proxy, in the 100 Continue response, that we're able to
+                # parse a multipart MIME document and extract the object and
+                # metadata from it. If we don't, then the proxy won't
+                # actually send the footer metadata.
+                have_metadata_footer = False
+                use_multiphase_commit = False
+                mime_documents_iter = iter([])
+                obj_input = request.environ['wsgi.input']
+
+                hundred_continue_headers = []
+                if config_true_value(
+                        request.headers.get(
+                            'X-Backend-Obj-Multiphase-Commit')):
+                    use_multiphase_commit = True
+                    hundred_continue_headers.append(
+                        ('X-Obj-Multiphase-Commit', 'yes'))
+
+                if config_true_value(
+                        request.headers.get('X-Backend-Obj-Metadata-Footer')):
+                    have_metadata_footer = True
+                    hundred_continue_headers.append(
+                        ('X-Obj-Metadata-Footer', 'yes'))
+
+                if have_metadata_footer or use_multiphase_commit:
+                    obj_input.set_hundred_continue_response_headers(
+                        hundred_continue_headers)
+                    mime_boundary = request.headers.get(
+                        'X-Backend-Obj-Multipart-Mime-Boundary')
+                    if not mime_boundary:
+                        return HTTPBadRequest("no MIME boundary")
+
+                    try:
+                        with ChunkReadTimeout(self.client_timeout):
+                            mime_documents_iter = iter_mime_headers_and_bodies(
+                                request.environ['wsgi.input'],
+                                mime_boundary, self.network_chunk_size)
+                            _junk_hdrs, obj_input = next(mime_documents_iter)
+                    except ChunkReadError:
+                        return HTTPClientDisconnect(request=request)
+                    except ChunkReadTimeout:
+                        return HTTPRequestTimeout(request=request)
+
+                timeout_reader = self._make_timeout_reader(obj_input)
+                try:
+                    for chunk in iter(timeout_reader, ''):
+                        start_time = time.time()
+                        if start_time > upload_expiration:
+                            self.logger.increment('PUT.timeouts')
+                            return HTTPRequestTimeout(request=request)
+                        etag.update(chunk)
+                        upload_size = writer.write(chunk)
+                        elapsed_time += time.time() - start_time
+                except ChunkReadError:
+                    return HTTPClientDisconnect(request=request)
+                except ChunkReadTimeout:
+                    return HTTPRequestTimeout(request=request)
+                if upload_size:
+                    self.logger.transfer_rate(
+                        'PUT.' + device + '.timing', elapsed_time,
+                        upload_size)
+                if fsize is not None and fsize != upload_size:
+                    return HTTPClientDisconnect(request=request)
+
+                footer_meta = {}
+                if have_metadata_footer:
+                    footer_meta = self._read_metadata_footer(
+                        mime_documents_iter)
+
+                request_etag = (footer_meta.get('etag') or
+                                request.headers.get('etag', '')).lower()
+                etag = etag.hexdigest()
+                if request_etag and request_etag != etag:
+                    return HTTPUnprocessableEntity(request=request)
+                metadata = {
+                    'X-Timestamp': request.timestamp.internal,
+                    'Content-Type': request.headers['content-type'],
+                    'ETag': etag,
+                    'Content-Length': str(upload_size),
+                }
+                metadata.update(val for val in request.headers.items()
+                                if (is_sys_or_user_meta('object', val[0]) or
+                                    is_object_transient_sysmeta(val[0])))
+                metadata.update(val for val in footer_meta.items()
+                                if (is_sys_or_user_meta('object', val[0]) or
+                                    is_object_transient_sysmeta(val[0])))
+                headers_to_copy = (
+                    request.headers.get(
+                        'X-Backend-Replication-Headers', '').split() +
+                    list(self.allowed_headers))
+                for header_key in headers_to_copy:
+                    if header_key in request.headers:
+                        header_caps = header_key.title()
+                        metadata[header_caps] = request.headers[header_key]
+                writer.put(metadata)
+
+                # if the PUT requires a two-phase commit (a data and a commit
+                # phase) send the proxy server another 100-continue response
+                # to indicate that we are finished writing object data
+                if use_multiphase_commit:
+                    request.environ['wsgi.input'].\
+                        send_hundred_continue_response()
+                    if not self._read_put_commit_message(mime_documents_iter):
+                        return HTTPServerError(request=request)
+
+                # got 2nd phase confirmation (when required), call commit to
+                # indicate a successful PUT
+                writer.commit(request.timestamp)
+
+                # Drain any remaining MIME docs from the socket. There
+                # shouldn't be any, but we must read the whole request body.
+                try:
+                    while True:
+                        with ChunkReadTimeout(self.client_timeout):
+                            _junk_hdrs, _junk_body = next(mime_documents_iter)
+                        drain(_junk_body, self.network_chunk_size,
+                              self.client_timeout)
+                except ChunkReadError:
+                    raise HTTPClientDisconnect()
+                except ChunkReadTimeout:
+                    raise HTTPRequestTimeout()
+                except StopIteration:
+                    pass
+
+        except (DiskFileXattrNotSupported, DiskFileNoSpace):
+            return HTTPInsufficientStorage(drive=device, request=request)
+        if orig_delete_at != new_delete_at:
+            if new_delete_at:
+                self.delete_at_update(
+                    'PUT', new_delete_at, account, container, obj, request,
+                    device, policy)
+            if orig_delete_at:
+                self.delete_at_update(
+                    'DELETE', orig_delete_at, account, container, obj,
+                    request, device, policy)
+        update_headers = HeaderKeyDict({
+            'x-size': metadata['Content-Length'],
+            'x-content-type': metadata['Content-Type'],
+            'x-timestamp': metadata['X-Timestamp'],
+            'x-etag': metadata['ETag']})
+        # apply any container update header overrides sent with request
+        self._check_container_override(update_headers, request.headers,
+                                       footer_meta)
+        self.container_update(
+            'PUT', account, container, obj, request,
+            update_headers,
+            device, policy)
+        return HTTPCreated(request=request, etag=etag)
+
+    @public
+    @timing_stats()
+    def GET(self, request):
+        """Handle HTTP GET requests for the Swift Object Server."""
+        device, partition, account, container, obj, policy = \
+            get_name_and_placement(request, 5, 5, True)
+        frag_prefs = safe_json_loads(
+            request.headers.get('X-Backend-Fragment-Preferences'))
+        try:
+            disk_file = self.get_diskfile(
+                device, partition, account, container, obj,
+                policy=policy, frag_prefs=frag_prefs)
+        except DiskFileDeviceUnavailable:
+            return HTTPInsufficientStorage(drive=device, request=request)
+        try:
+            with disk_file.open():
+                metadata = disk_file.get_metadata()
+                obj_size = int(metadata['Content-Length'])
+                file_x_ts = Timestamp(metadata['X-Timestamp'])
+                keep_cache = (self.keep_cache_private or
+                              ('X-Auth-Token' not in request.headers and
+                               'X-Storage-Token' not in request.headers))
+                conditional_etag = resolve_etag_is_at_header(request, metadata)
+                response = Response(
+                    app_iter=disk_file.reader(keep_cache=keep_cache),
+                    request=request, conditional_response=True,
+                    conditional_etag=conditional_etag)
+                response.headers['Content-Type'] = metadata.get(
+                    'Content-Type', 'application/octet-stream')
+                for key, value in metadata.items():
+                    if (is_sys_or_user_meta('object', key) or
+                            is_object_transient_sysmeta(key) or
+                            key.lower() in self.allowed_headers):
+                        response.headers[key] = value
+                response.etag = metadata['ETag']
+                response.last_modified = math.ceil(float(file_x_ts))
+                response.content_length = obj_size
+                try:
+                    response.content_encoding = metadata[
+                        'Content-Encoding']
+                except KeyError:
+                    pass
+                response.headers['X-Timestamp'] = file_x_ts.normal
+                response.headers['X-Backend-Timestamp'] = file_x_ts.internal
+                response.headers['X-Backend-Data-Timestamp'] = \
+                    disk_file.data_timestamp.internal
+                if disk_file.durable_timestamp:
+                    response.headers['X-Backend-Durable-Timestamp'] = \
+                        disk_file.durable_timestamp.internal
+                response.headers['X-Backend-Fragments'] = \
+                    _make_backend_fragments_header(disk_file.fragments)
+                resp = request.get_response(response)
+        except DiskFileXattrNotSupported:
+            return HTTPInsufficientStorage(drive=device, request=request)
+        except (DiskFileNotExist, DiskFileQuarantined) as e:
+            headers = {}
+            if hasattr(e, 'timestamp'):
+                headers['X-Backend-Timestamp'] = e.timestamp.internal
+            resp = HTTPNotFound(request=request, headers=headers,
+                                conditional_response=True)
         return resp
 
     @public
-    @timing_stats
-    def GET(self, request):
-        """Handle HTTP GET requests for the Swift Object Server."""
-        try:
-            device, partition, account, container, obj = \
-                split_path(unquote(request.path), 5, 5, True)
-            validate_device_partition(device, partition)
-        except ValueError, err:
-            return HTTPBadRequest(body=str(err), request=request,
-                                  content_type='text/plain')
-        if self.mount_check and not check_mount(self.devices, device):
-            return HTTPInsufficientStorage(drive=device, request=request)
-        file = DiskFile(self.devices, device, partition, account, container,
-                        obj, self.logger, keep_data_fp=True,
-                        disk_chunk_size=self.disk_chunk_size,
-                        iter_hook=sleep)
-        if file.is_deleted() or file.is_expired():
-            if request.headers.get('if-match') == '*':
-                return HTTPPreconditionFailed(request=request)
-            else:
-                return HTTPNotFound(request=request)
-        try:
-            file_size = file.get_data_file_size()
-        except (DiskFileError, DiskFileNotExist):
-            file.quarantine()
-            return HTTPNotFound(request=request)
-        if request.headers.get('if-match') not in (None, '*') and \
-                file.metadata['ETag'] not in request.if_match:
-            file.close()
-            return HTTPPreconditionFailed(request=request)
-        if request.headers.get('if-none-match') is not None:
-            if file.metadata['ETag'] in request.if_none_match:
-                resp = HTTPNotModified(request=request)
-                resp.etag = file.metadata['ETag']
-                file.close()
-                return resp
-        try:
-            if_unmodified_since = request.if_unmodified_since
-        except (OverflowError, ValueError):
-            # catches timestamps before the epoch
-            return HTTPPreconditionFailed(request=request)
-        if if_unmodified_since and \
-                datetime.fromtimestamp(
-                    float(file.metadata['X-Timestamp']), UTC) > \
-                if_unmodified_since:
-            file.close()
-            return HTTPPreconditionFailed(request=request)
-        try:
-            if_modified_since = request.if_modified_since
-        except (OverflowError, ValueError):
-            # catches timestamps before the epoch
-            return HTTPPreconditionFailed(request=request)
-        if if_modified_since and \
-                datetime.fromtimestamp(
-                    float(file.metadata['X-Timestamp']), UTC) < \
-                if_modified_since:
-            file.close()
-            return HTTPNotModified(request=request)
-        response = Response(app_iter=file,
-                            request=request, conditional_response=True)
-        response.headers['Content-Type'] = file.metadata.get(
-            'Content-Type', 'application/octet-stream')
-        for key, value in file.metadata.iteritems():
-            if key.lower().startswith('x-object-meta-') or \
-                    key.lower() in self.allowed_headers:
-                response.headers[key] = value
-        response.etag = file.metadata['ETag']
-        response.last_modified = float(file.metadata['X-Timestamp'])
-        response.content_length = file_size
-        if response.content_length < self.keep_cache_size and \
-                (self.keep_cache_private or
-                 ('X-Auth-Token' not in request.headers and
-                  'X-Storage-Token' not in request.headers)):
-            file.keep_cache = True
-        if 'Content-Encoding' in file.metadata:
-            response.content_encoding = file.metadata['Content-Encoding']
-        response.headers['X-Timestamp'] = file.metadata['X-Timestamp']
-        return request.get_response(response)
-
-    @public
-    @timing_stats
+    @timing_stats(sample_rate=0.8)
     def HEAD(self, request):
         """Handle HTTP HEAD requests for the Swift Object Server."""
+        device, partition, account, container, obj, policy = \
+            get_name_and_placement(request, 5, 5, True)
+        frag_prefs = safe_json_loads(
+            request.headers.get('X-Backend-Fragment-Preferences'))
         try:
-            device, partition, account, container, obj = \
-                split_path(unquote(request.path), 5, 5, True)
-            validate_device_partition(device, partition)
-        except ValueError, err:
-            resp = HTTPBadRequest(request=request)
-            resp.content_type = 'text/plain'
-            resp.body = str(err)
-            return resp
-        if self.mount_check and not check_mount(self.devices, device):
+            disk_file = self.get_diskfile(
+                device, partition, account, container, obj,
+                policy=policy, frag_prefs=frag_prefs)
+        except DiskFileDeviceUnavailable:
             return HTTPInsufficientStorage(drive=device, request=request)
-        file = DiskFile(self.devices, device, partition, account, container,
-                        obj, self.logger, disk_chunk_size=self.disk_chunk_size)
-        if file.is_deleted() or file.is_expired():
-            return HTTPNotFound(request=request)
         try:
-            file_size = file.get_data_file_size()
-        except (DiskFileError, DiskFileNotExist):
-            file.quarantine()
-            return HTTPNotFound(request=request)
-        response = Response(request=request, conditional_response=True)
-        response.headers['Content-Type'] = file.metadata.get(
+            metadata = disk_file.read_metadata()
+        except DiskFileXattrNotSupported:
+            return HTTPInsufficientStorage(drive=device, request=request)
+        except (DiskFileNotExist, DiskFileQuarantined) as e:
+            headers = {}
+            if hasattr(e, 'timestamp'):
+                headers['X-Backend-Timestamp'] = e.timestamp.internal
+            return HTTPNotFound(request=request, headers=headers,
+                                conditional_response=True)
+        conditional_etag = resolve_etag_is_at_header(request, metadata)
+        response = Response(request=request, conditional_response=True,
+                            conditional_etag=conditional_etag)
+        response.headers['Content-Type'] = metadata.get(
             'Content-Type', 'application/octet-stream')
-        for key, value in file.metadata.iteritems():
-            if key.lower().startswith('x-object-meta-') or \
-                    key.lower() in self.allowed_headers:
+        for key, value in metadata.items():
+            if (is_sys_or_user_meta('object', key) or
+                    is_object_transient_sysmeta(key) or
+                    key.lower() in self.allowed_headers):
                 response.headers[key] = value
-        response.etag = file.metadata['ETag']
-        response.last_modified = float(file.metadata['X-Timestamp'])
+        response.etag = metadata['ETag']
+        ts = Timestamp(metadata['X-Timestamp'])
+        response.last_modified = math.ceil(float(ts))
         # Needed for container sync feature
-        response.headers['X-Timestamp'] = file.metadata['X-Timestamp']
-        response.content_length = file_size
-        if 'Content-Encoding' in file.metadata:
-            response.content_encoding = file.metadata['Content-Encoding']
+        response.headers['X-Timestamp'] = ts.normal
+        response.headers['X-Backend-Timestamp'] = ts.internal
+        response.headers['X-Backend-Data-Timestamp'] = \
+            disk_file.data_timestamp.internal
+        if disk_file.durable_timestamp:
+            response.headers['X-Backend-Durable-Timestamp'] = \
+                disk_file.durable_timestamp.internal
+        response.headers['X-Backend-Fragments'] = \
+            _make_backend_fragments_header(disk_file.fragments)
+        response.content_length = int(metadata['Content-Length'])
+        try:
+            response.content_encoding = metadata['Content-Encoding']
+        except KeyError:
+            pass
         return response
 
     @public
-    @timing_stats
+    @timing_stats()
     def DELETE(self, request):
         """Handle HTTP DELETE requests for the Swift Object Server."""
+        device, partition, account, container, obj, policy = \
+            get_name_and_placement(request, 5, 5, True)
+        req_timestamp = valid_timestamp(request)
         try:
-            device, partition, account, container, obj = \
-                split_path(unquote(request.path), 5, 5, True)
-            validate_device_partition(device, partition)
-        except ValueError, e:
-            return HTTPBadRequest(body=str(e), request=request,
-                                  content_type='text/plain')
-        if 'x-timestamp' not in request.headers or \
-                not check_float(request.headers['x-timestamp']):
-            return HTTPBadRequest(body='Missing timestamp', request=request,
-                                  content_type='text/plain')
-        if self.mount_check and not check_mount(self.devices, device):
+            disk_file = self.get_diskfile(
+                device, partition, account, container, obj,
+                policy=policy)
+        except DiskFileDeviceUnavailable:
             return HTTPInsufficientStorage(drive=device, request=request)
-        response_class = HTTPNoContent
-        file = DiskFile(self.devices, device, partition, account, container,
-                        obj, self.logger, disk_chunk_size=self.disk_chunk_size)
-        if 'x-if-delete-at' in request.headers and \
-                int(request.headers['x-if-delete-at']) != \
-                int(file.metadata.get('X-Delete-At') or 0):
-            return HTTPPreconditionFailed(
-                request=request,
-                body='X-If-Delete-At and X-Delete-At do not match')
-        orig_timestamp = file.metadata.get('X-Timestamp')
-        if file.is_deleted() or file.is_expired():
+        try:
+            orig_metadata = disk_file.read_metadata()
+        except DiskFileXattrNotSupported:
+            return HTTPInsufficientStorage(drive=device, request=request)
+        except DiskFileExpired as e:
+            orig_timestamp = e.timestamp
+            orig_metadata = e.metadata
             response_class = HTTPNotFound
-        metadata = {
-            'X-Timestamp': request.headers['X-Timestamp'], 'deleted': True,
-        }
-        with file.mkstemp() as (fd, tmppath):
-            old_delete_at = int(file.metadata.get('X-Delete-At') or 0)
-            if old_delete_at:
-                self.delete_at_update('DELETE', old_delete_at, account,
-                                      container, obj, request.headers, device)
-            file.put(fd, tmppath, metadata, extension='.ts')
-        file.unlinkold(metadata['X-Timestamp'])
-        if not orig_timestamp or \
-                orig_timestamp < request.headers['x-timestamp']:
+        except DiskFileDeleted as e:
+            orig_timestamp = e.timestamp
+            orig_metadata = {}
+            response_class = HTTPNotFound
+        except (DiskFileNotExist, DiskFileQuarantined):
+            orig_timestamp = 0
+            orig_metadata = {}
+            response_class = HTTPNotFound
+        else:
+            orig_timestamp = disk_file.data_timestamp
+            if orig_timestamp < req_timestamp:
+                response_class = HTTPNoContent
+            else:
+                response_class = HTTPConflict
+        response_timestamp = max(orig_timestamp, req_timestamp)
+        orig_delete_at = int(orig_metadata.get('X-Delete-At') or 0)
+        try:
+            req_if_delete_at_val = request.headers['x-if-delete-at']
+            req_if_delete_at = int(req_if_delete_at_val)
+        except KeyError:
+            pass
+        except ValueError:
+            return HTTPBadRequest(
+                request=request,
+                body='Bad X-If-Delete-At header value')
+        else:
+            # request includes x-if-delete-at; we must not place a tombstone
+            # if we can not verify the x-if-delete-at time
+            if not orig_timestamp:
+                # no object found at all
+                return HTTPNotFound()
+            if orig_delete_at != req_if_delete_at:
+                return HTTPPreconditionFailed(
+                    request=request,
+                    body='X-If-Delete-At and X-Delete-At do not match')
+            else:
+                # differentiate success from no object at all
+                response_class = HTTPNoContent
+        if orig_delete_at:
+            self.delete_at_update('DELETE', orig_delete_at, account,
+                                  container, obj, request, device,
+                                  policy)
+        if orig_timestamp < req_timestamp:
+            try:
+                disk_file.delete(req_timestamp)
+            except DiskFileNoSpace:
+                return HTTPInsufficientStorage(drive=device, request=request)
             self.container_update(
-                'DELETE', account, container, obj, request.headers,
-                {'x-timestamp': metadata['X-Timestamp'],
-                 'x-trans-id': request.headers.get('x-trans-id', '-')},
-                device)
-        resp = response_class(request=request)
-        return resp
+                'DELETE', account, container, obj, request,
+                HeaderKeyDict({'x-timestamp': req_timestamp.internal}),
+                device, policy)
+        return response_class(
+            request=request,
+            headers={'X-Backend-Timestamp': response_timestamp.internal})
 
     @public
-    @timing_stats
+    @replication
+    @timing_stats(sample_rate=0.1)
     def REPLICATE(self, request):
         """
         Handle REPLICATE requests for the Swift Object Server.  This is used
         by the object replicator to get hashes for directories.
+
+        Note that the name REPLICATE is preserved for historical reasons as
+        this verb really just returns the hashes information for the specified
+        parameters and is used, for example, by both replication and EC.
         """
+        device, partition, suffix_parts, policy = \
+            get_name_and_placement(request, 2, 3, True)
+        suffixes = suffix_parts.split('-') if suffix_parts else []
         try:
-            device, partition, suffix = split_path(
-                unquote(request.path), 2, 3, True)
-            validate_device_partition(device, partition)
-        except ValueError, e:
-            return HTTPBadRequest(body=str(e), request=request,
-                                  content_type='text/plain')
-        if self.mount_check and not check_mount(self.devices, device):
-            return HTTPInsufficientStorage(drive=device, request=request)
-        path = os.path.join(self.devices, device, DATADIR, partition)
-        if not os.path.exists(path):
-            mkdirs(path)
-        suffixes = suffix.split('-') if suffix else []
-        _junk, hashes = tpool_reraise(get_hashes, path, recalculate=suffixes)
-        return Response(body=pickle.dumps(hashes))
+            hashes = self._diskfile_router[policy].get_hashes(
+                device, partition, suffixes, policy)
+        except DiskFileDeviceUnavailable:
+            resp = HTTPInsufficientStorage(drive=device, request=request)
+        else:
+            resp = Response(body=pickle.dumps(hashes))
+        return resp
+
+    @public
+    @replication
+    @timing_stats(sample_rate=0.1)
+    def SSYNC(self, request):
+        return Response(app_iter=ssync_receiver.Receiver(self, request)())
 
     def __call__(self, env, start_response):
         """WSGI Application entry point for the Swift Object Server."""
@@ -868,17 +1092,18 @@ class ObjectController(object):
         self.logger.txn_id = req.headers.get('x-trans-id', None)
 
         if not check_utf8(req.path_info):
-            res = HTTPPreconditionFailed(body='Invalid UTF8')
+            res = HTTPPreconditionFailed(body='Invalid UTF8 or contains NULL')
         else:
             try:
                 # disallow methods which have not been marked 'public'
-                try:
-                    method = getattr(self, req.method)
-                    getattr(method, 'publicly_accessible')
-                except AttributeError:
+                if req.method not in self.allowed_methods:
                     res = HTTPMethodNotAllowed()
                 else:
-                    res = method(req)
+                    res = getattr(self, req.method)(req)
+            except DiskFileCollision:
+                res = HTTPForbidden(request=req)
+            except HTTPException as error_response:
+                res = error_response
             except (Exception, Timeout):
                 self.logger.exception(_(
                     'ERROR __call__ error with %(method)s'
@@ -886,16 +1111,9 @@ class ObjectController(object):
                 res = HTTPInternalServerError(body=traceback.format_exc())
         trans_time = time.time() - start_time
         if self.log_requests:
-            log_line = '%s - - [%s] "%s %s" %s %s "%s" "%s" "%s" %.4f' % (
-                req.remote_addr,
-                time.strftime('%d/%b/%Y:%H:%M:%S +0000',
-                              time.gmtime()),
-                req.method, req.path, res.status.split()[0],
-                res.content_length or '-', req.referer or '-',
-                req.headers.get('x-trans-id', '-'),
-                req.user_agent or '-',
-                trans_time)
-            if req.method == 'REPLICATE':
+            log_line = get_log_line(req, res, trans_time, '')
+            if req.method in ('REPLICATE', 'SSYNC') or \
+                    'X-Backend-Replication' in req.headers:
                 self.logger.debug(log_line)
             else:
                 self.logger.info(log_line)
@@ -903,7 +1121,81 @@ class ObjectController(object):
             slow = self.slow - trans_time
             if slow > 0:
                 sleep(slow)
-        return res(env, start_response)
+
+        # To be able to zero-copy send the object, we need a few things.
+        # First, we have to be responding successfully to a GET, or else we're
+        # not sending the object. Second, we have to be able to extract the
+        # socket file descriptor from the WSGI input object. Third, the
+        # diskfile has to support zero-copy send.
+        #
+        # There's a good chance that this could work for 206 responses too,
+        # but the common case is sending the whole object, so we'll start
+        # there.
+        if req.method == 'GET' and res.status_int == 200 and \
+           isinstance(env['wsgi.input'], wsgi.Input):
+            app_iter = getattr(res, 'app_iter', None)
+            checker = getattr(app_iter, 'can_zero_copy_send', None)
+            if checker and checker():
+                # For any kind of zero-copy thing like sendfile or splice, we
+                # need the file descriptor. Eventlet doesn't provide a clean
+                # way of getting that, so we resort to this.
+                wsock = env['wsgi.input'].get_socket()
+                wsockfd = wsock.fileno()
+
+                # Don't call zero_copy_send() until after we force the HTTP
+                # headers out of Eventlet and into the socket.
+                def zero_copy_iter():
+                    # If possible, set TCP_CORK so that headers don't
+                    # immediately go on the wire, but instead, wait for some
+                    # response body to make the TCP frames as large as
+                    # possible (and hence as few packets as possible).
+                    #
+                    # On non-Linux systems, we might consider TCP_NODELAY, but
+                    # since the only known zero-copy-capable diskfile uses
+                    # Linux-specific syscalls, we'll defer that work until
+                    # someone needs it.
+                    if hasattr(socket, 'TCP_CORK'):
+                        wsock.setsockopt(socket.IPPROTO_TCP,
+                                         socket.TCP_CORK, 1)
+                    yield EventletPlungerString()
+                    try:
+                        app_iter.zero_copy_send(wsockfd)
+                    except Exception:
+                        self.logger.exception("zero_copy_send() blew up")
+                        raise
+                    yield ''
+
+                # Get headers ready to go out
+                res(env, start_response)
+                return zero_copy_iter()
+            else:
+                return res(env, start_response)
+        else:
+            return res(env, start_response)
+
+
+def global_conf_callback(preloaded_app_conf, global_conf):
+    """
+    Callback for swift.common.wsgi.run_wsgi during the global_conf
+    creation so that we can add our replication_semaphore, used to
+    limit the number of concurrent SSYNC_REQUESTS across all
+    workers.
+
+    :param preloaded_app_conf: The preloaded conf for the WSGI app.
+                               This conf instance will go away, so
+                               just read from it, don't write.
+    :param global_conf: The global conf that will eventually be
+                        passed to the app_factory function later.
+                        This conf is created before the worker
+                        subprocesses are forked, so can be useful to
+                        set up semaphores, shared memory, etc.
+    """
+    replication_concurrency = int(
+        preloaded_app_conf.get('replication_concurrency') or 4)
+    if replication_concurrency:
+        # Have to put the value in a list so it can get past paste
+        global_conf['replication_semaphore'] = [
+            multiprocessing.BoundedSemaphore(replication_concurrency)]
 
 
 def app_factory(global_conf, **local_conf):

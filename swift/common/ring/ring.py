@@ -1,4 +1,4 @@
-# Copyright (c) 2010-2012 OpenStack, LLC.
+# Copyright (c) 2010-2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,7 +14,8 @@
 # limitations under the License.
 
 import array
-import cPickle as pickle
+import six.moves.cPickle as pickle
+import json
 from collections import defaultdict
 from gzip import GzipFile
 from os.path import getmtime
@@ -22,14 +23,16 @@ import struct
 from time import time
 import os
 from io import BufferedReader
+from hashlib import md5
+from itertools import chain
+from tempfile import NamedTemporaryFile
+import sys
 
+from six.moves import range
+
+from swift.common.exceptions import RingLoadError
 from swift.common.utils import hash_path, validate_configuration
 from swift.common.ring.utils import tiers_for_dev
-
-try:
-    import simplejson as json
-except ImportError:
-    import json
 
 
 class RingData(object):
@@ -40,23 +43,52 @@ class RingData(object):
         self._replica2part2dev_id = replica2part2dev_id
         self._part_shift = part_shift
 
+        for dev in self.devs:
+            if dev is not None:
+                dev.setdefault("region", 1)
+
     @classmethod
-    def deserialize_v1(cls, gz_file):
+    def deserialize_v1(cls, gz_file, metadata_only=False):
+        """
+        Deserialize a v1 ring file into a dictionary with `devs`, `part_shift`,
+        and `replica2part2dev_id` keys.
+
+        If the optional kwarg `metadata_only` is True, then the
+        `replica2part2dev_id` is not loaded and that key in the returned
+        dictionary just has the value `[]`.
+
+        :param file gz_file: An opened file-like object which has already
+                             consumed the 6 bytes of magic and version.
+        :param bool metadata_only: If True, only load `devs` and `part_shift`
+        :returns: A dict containing `devs`, `part_shift`, and
+                  `replica2part2dev_id`
+        """
+
         json_len, = struct.unpack('!I', gz_file.read(4))
         ring_dict = json.loads(gz_file.read(json_len))
         ring_dict['replica2part2dev_id'] = []
+
+        if metadata_only:
+            return ring_dict
+
+        byteswap = (ring_dict.get('byteorder', sys.byteorder) != sys.byteorder)
+
         partition_count = 1 << (32 - ring_dict['part_shift'])
-        for x in xrange(ring_dict['replica_count']):
-            ring_dict['replica2part2dev_id'].append(
-                array.array('H', gz_file.read(2 * partition_count)))
+        for x in range(ring_dict['replica_count']):
+            part2dev = array.array('H', gz_file.read(2 * partition_count))
+            if byteswap:
+                part2dev.byteswap()
+            ring_dict['replica2part2dev_id'].append(part2dev)
+
         return ring_dict
 
     @classmethod
-    def load(cls, filename):
+    def load(cls, filename, metadata_only=False):
         """
         Load ring data from a file.
 
         :param filename: Path to a file serialized by the save() method.
+        :param bool metadata_only: If True, only load `devs` and `part_shift`.
         :returns: A RingData instance containing the loaded data.
         """
         gz_file = GzipFile(filename, 'rb')
@@ -67,15 +99,18 @@ class RingData(object):
         # See if the file is in the new format
         magic = gz_file.read(4)
         if magic == 'R1NG':
-            version, = struct.unpack('!H', gz_file.read(2))
-            if version == 1:
-                ring_data = cls.deserialize_v1(gz_file)
+            format_version, = struct.unpack('!H', gz_file.read(2))
+            if format_version == 1:
+                ring_data = cls.deserialize_v1(
+                    gz_file, metadata_only=metadata_only)
             else:
-                raise Exception('Unknown ring format version %d' % version)
+                raise Exception('Unknown ring format version %d' %
+                                format_version)
         else:
             # Assume old-style pickled ring
             gz_file.seek(0)
             ring_data = pickle.load(gz_file)
+
         if not hasattr(ring_data, 'devs'):
             ring_data = RingData(ring_data['replica2part2dev_id'],
                                  ring_data['devs'], ring_data['part_shift'])
@@ -85,24 +120,37 @@ class RingData(object):
         # Write out new-style serialization magic and version:
         file_obj.write(struct.pack('!4sH', 'R1NG', 1))
         ring = self.to_dict()
-        json_text = json.dumps(
+        json_encoder = json.JSONEncoder(sort_keys=True)
+        json_text = json_encoder.encode(
             {'devs': ring['devs'], 'part_shift': ring['part_shift'],
-             'replica_count': len(ring['replica2part2dev_id'])})
+             'replica_count': len(ring['replica2part2dev_id']),
+             'byteorder': sys.byteorder})
         json_len = len(json_text)
         file_obj.write(struct.pack('!I', json_len))
         file_obj.write(json_text)
         for part2dev_id in ring['replica2part2dev_id']:
             file_obj.write(part2dev_id.tostring())
 
-    def save(self, filename):
+    def save(self, filename, mtime=1300507380.0):
         """
         Serialize this RingData instance to disk.
 
         :param filename: File into which this instance should be serialized.
+        :param mtime: time used to override mtime for gzip, default or None
+                      if the caller wants to include time
         """
-        gz_file = GzipFile(filename, 'wb')
+        # Override the timestamp so that the same ring data creates
+        # the same bytes on disk. This makes a checksum comparison a
+        # good way to see if two rings are identical.
+        tempf = NamedTemporaryFile(dir=".", prefix=filename, delete=False)
+        gz_file = GzipFile(filename, mode='wb', fileobj=tempf, mtime=mtime)
         self.serialize_v1(gz_file)
         gz_file.close()
+        tempf.flush()
+        os.fsync(tempf.fileno())
+        tempf.close()
+        os.chmod(tempf.name, 0o644)
+        os.rename(tempf.name, filename)
 
     def to_dict(self):
         return {'devs': self.devs,
@@ -116,9 +164,14 @@ class Ring(object):
 
     :param serialized_path: path to serialized RingData instance
     :param reload_time: time interval in seconds to check for a ring change
+    :param ring_name: ring name string (basically specified from policy)
+    :param validation_hook: hook point to validate ring configuration ontime
+
+    :raises: RingLoadError if the loaded ring data violates its constraint
     """
 
-    def __init__(self, serialized_path, reload_time=15, ring_name=None):
+    def __init__(self, serialized_path, reload_time=15, ring_name=None,
+                 validation_hook=lambda ring_data: None):
         # can't use the ring unless HASH_PATH_SUFFIX is set
         validate_configuration()
         if ring_name:
@@ -127,18 +180,70 @@ class Ring(object):
         else:
             self.serialized_path = os.path.join(serialized_path)
         self.reload_time = reload_time
+        self._validation_hook = validation_hook
         self._reload(force=True)
 
     def _reload(self, force=False):
         self._rtime = time() + self.reload_time
         if force or self.has_changed():
             ring_data = RingData.load(self.serialized_path)
+
+            try:
+                self._validation_hook(ring_data)
+            except RingLoadError:
+                if force:
+                    raise
+                else:
+                    # In runtime reload at working server, it's ok to use old
+                    # ring data if the new ring data is invalid.
+                    return
+
             self._mtime = getmtime(self.serialized_path)
             self._devs = ring_data.devs
+            # NOTE(akscram): Replication parameters like replication_ip
+            #                and replication_port are required for
+            #                replication process. An old replication
+            #                ring doesn't contain this parameters into
+            #                device. Old-style pickled rings won't have
+            #                region information.
+            for dev in self._devs:
+                if dev:
+                    dev.setdefault('region', 1)
+                    if 'ip' in dev:
+                        dev.setdefault('replication_ip', dev['ip'])
+                    if 'port' in dev:
+                        dev.setdefault('replication_port', dev['port'])
 
             self._replica2part2dev_id = ring_data._replica2part2dev_id
             self._part_shift = ring_data._part_shift
             self._rebuild_tier_data()
+
+            # Do this now, when we know the data has changed, rather than
+            # doing it on every call to get_more_nodes().
+            #
+            # Since this is to speed up the finding of handoffs, we only
+            # consider devices with at least one partition assigned. This
+            # way, a region, zone, or server with no partitions assigned
+            # does not count toward our totals, thereby keeping the early
+            # bailouts in get_more_nodes() working.
+            dev_ids_with_parts = set()
+            for part2dev_id in self._replica2part2dev_id:
+                for dev_id in part2dev_id:
+                    dev_ids_with_parts.add(dev_id)
+
+            regions = set()
+            zones = set()
+            ips = set()
+            self._num_devs = 0
+            for dev in self._devs:
+                if dev and dev['id'] in dev_ids_with_parts:
+                    regions.add(dev['region'])
+                    zones.add((dev['region'], dev['zone']))
+                    ips.add((dev['region'], dev['zone'], dev['ip']))
+                    self._num_devs += 1
+            self._num_regions = len(regions)
+            self._num_zones = len(zones)
+            self._num_ips = len(ips)
 
     def _rebuild_tier_data(self):
         self.tier2devs = defaultdict(list)
@@ -149,7 +254,7 @@ class Ring(object):
                 self.tier2devs[tier].append(dev)
 
         tiers_by_length = defaultdict(list)
-        for tier in self.tier2devs.keys():
+        for tier in self.tier2devs:
             tiers_by_length[len(tier)].append(tier)
         self.tiers_by_length = sorted(tiers_by_length.values(),
                                       key=lambda x: len(x[0]))
@@ -158,7 +263,7 @@ class Ring(object):
 
     @property
     def replica_count(self):
-        """Number of replicas used in the ring."""
+        """Number of replicas (full or partial) used in the ring."""
         return len(self._replica2part2dev_id)
 
     @property
@@ -182,6 +287,32 @@ class Ring(object):
         """
         return getmtime(self.serialized_path) != self._mtime
 
+    def _get_part_nodes(self, part):
+        part_nodes = []
+        seen_ids = set()
+        for r2p2d in self._replica2part2dev_id:
+            if part < len(r2p2d):
+                dev_id = r2p2d[part]
+                if dev_id not in seen_ids:
+                    part_nodes.append(self.devs[dev_id])
+                    seen_ids.add(dev_id)
+        return [dict(node, index=i) for i, node in enumerate(part_nodes)]
+
+    def get_part(self, account, container=None, obj=None):
+        """
+        Get the partition for an account/container/object.
+
+        :param account: account name
+        :param container: container name
+        :param obj: object name
+        :returns: the partition number
+        """
+        key = hash_path(account, container, obj, raw_digest=True)
+        if time() > self._rtime:
+            self._reload()
+        part = struct.unpack_from('>I', key)[0] >> self._part_shift
+        return part
+
     def get_part_nodes(self, part):
         """
         Get the nodes that are responsible for the partition. If one
@@ -196,9 +327,7 @@ class Ring(object):
 
         if time() > self._rtime:
             self._reload()
-        seen_ids = set()
-        return [self._devs[r[part]] for r in self._replica2part2dev_id
-                if not (r[part] in seen_ids or seen_ids.add(r[part]))]
+        return self._get_part_nodes(part)
 
     def get_nodes(self, account, container=None, obj=None):
         """
@@ -215,6 +344,7 @@ class Ring(object):
 
         ======  ===============================================================
         id      unique integer identifier amongst devices
+        index   offset into the primary node list for the partition
         weight  a float of the relative weight of this device as compared to
                 others; this indicates how many partitions the builder will try
                 to assign to this device
@@ -228,17 +358,17 @@ class Ring(object):
                 hardware description
         ======  ===============================================================
         """
-        key = hash_path(account, container, obj, raw_digest=True)
-        if time() > self._rtime:
-            self._reload()
-        part = struct.unpack_from('>I', key)[0] >> self._part_shift
-        seen_ids = set()
-        return part, [self._devs[r[part]] for r in self._replica2part2dev_id
-                      if not (r[part] in seen_ids or seen_ids.add(r[part]))]
+        part = self.get_part(account, container, obj)
+        return part, self._get_part_nodes(part)
 
     def get_more_nodes(self, part):
         """
         Generator to get extra nodes for a partition for hinted handoff.
+
+        The handoff nodes will try to be in zones other than the
+        primary zones, will take into account the device weights, and
+        will usually keep the same sequences of handoffs even with
+        ring changes.
 
         :param part: partition to get handoff nodes for
         :returns: generator of node dicts
@@ -247,22 +377,103 @@ class Ring(object):
         """
         if time() > self._rtime:
             self._reload()
-        used_tiers = set()
-        for part2dev_id in self._replica2part2dev_id:
-            for tier in tiers_for_dev(self._devs[part2dev_id[part]]):
-                used_tiers.add(tier)
+        primary_nodes = self._get_part_nodes(part)
 
-        for level in self.tiers_by_length:
-            tiers = list(level)
-            while tiers:
-                tier = tiers.pop(part % len(tiers))
-                if tier in used_tiers:
-                    continue
-                for i in xrange(len(self.tier2devs[tier])):
-                    dev = self.tier2devs[tier][(part + i) %
-                                               len(self.tier2devs[tier])]
-                    if not dev.get('weight'):
-                        continue
-                    yield dev
-                    used_tiers.update(tiers_for_dev(dev))
-                    break
+        used = set(d['id'] for d in primary_nodes)
+        same_regions = set(d['region'] for d in primary_nodes)
+        same_zones = set((d['region'], d['zone']) for d in primary_nodes)
+        same_ips = set(
+            (d['region'], d['zone'], d['ip']) for d in primary_nodes)
+
+        parts = len(self._replica2part2dev_id[0])
+        start = struct.unpack_from(
+            '>I', md5(str(part)).digest())[0] >> self._part_shift
+        inc = int(parts / 65536) or 1
+        # Multiple loops for execution speed; the checks and bookkeeping get
+        # simpler as you go along
+        hit_all_regions = len(same_regions) == self._num_regions
+        for handoff_part in chain(range(start, parts, inc),
+                                  range(inc - ((parts - start) % inc),
+                                        start, inc)):
+            if hit_all_regions:
+                # At this point, there are no regions left untouched, so we
+                # can stop looking.
+                break
+            for part2dev_id in self._replica2part2dev_id:
+                if handoff_part < len(part2dev_id):
+                    dev_id = part2dev_id[handoff_part]
+                    dev = self._devs[dev_id]
+                    region = dev['region']
+                    if dev_id not in used and region not in same_regions:
+                        yield dev
+                        used.add(dev_id)
+                        same_regions.add(region)
+                        zone = dev['zone']
+                        ip = (region, zone, dev['ip'])
+                        same_zones.add((region, zone))
+                        same_ips.add(ip)
+                        if len(same_regions) == self._num_regions:
+                            hit_all_regions = True
+                            break
+
+        hit_all_zones = len(same_zones) == self._num_zones
+        for handoff_part in chain(range(start, parts, inc),
+                                  range(inc - ((parts - start) % inc),
+                                        start, inc)):
+            if hit_all_zones:
+                # Much like we stopped looking for fresh regions before, we
+                # can now stop looking for fresh zones; there are no more.
+                break
+            for part2dev_id in self._replica2part2dev_id:
+                if handoff_part < len(part2dev_id):
+                    dev_id = part2dev_id[handoff_part]
+                    dev = self._devs[dev_id]
+                    zone = (dev['region'], dev['zone'])
+                    if dev_id not in used and zone not in same_zones:
+                        yield dev
+                        used.add(dev_id)
+                        same_zones.add(zone)
+                        ip = zone + (dev['ip'],)
+                        same_ips.add(ip)
+                        if len(same_zones) == self._num_zones:
+                            hit_all_zones = True
+                            break
+
+        hit_all_ips = len(same_ips) == self._num_ips
+        for handoff_part in chain(range(start, parts, inc),
+                                  range(inc - ((parts - start) % inc),
+                                        start, inc)):
+            if hit_all_ips:
+                # We've exhausted the pool of unused backends, so stop
+                # looking.
+                break
+            for part2dev_id in self._replica2part2dev_id:
+                if handoff_part < len(part2dev_id):
+                    dev_id = part2dev_id[handoff_part]
+                    dev = self._devs[dev_id]
+                    ip = (dev['region'], dev['zone'], dev['ip'])
+                    if dev_id not in used and ip not in same_ips:
+                        yield dev
+                        used.add(dev_id)
+                        same_ips.add(ip)
+                        if len(same_ips) == self._num_ips:
+                            hit_all_ips = True
+                            break
+
+        hit_all_devs = len(used) == self._num_devs
+        for handoff_part in chain(range(start, parts, inc),
+                                  range(inc - ((parts - start) % inc),
+                                        start, inc)):
+            if hit_all_devs:
+                # We've used every device we have, so let's stop looking for
+                # unused devices now.
+                break
+            for part2dev_id in self._replica2part2dev_id:
+                if handoff_part < len(part2dev_id):
+                    dev_id = part2dev_id[handoff_part]
+                    if dev_id not in used:
+                        yield self._devs[dev_id]
+                        used.add(dev_id)
+                        if len(used) == self._num_devs:
+                            hit_all_devs = True
+                            break

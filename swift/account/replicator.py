@@ -1,4 +1,4 @@
-# Copyright (c) 2010-2012 OpenStack, LLC.
+# Copyright (c) 2010-2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,12 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from swift.account import server as account_server
-from swift.common import db, db_replicator
+from swift.account.backend import AccountBroker, DATADIR
+from swift.common import db_replicator
 
 
 class AccountReplicator(db_replicator.Replicator):
     server_type = 'account'
-    brokerclass = db.AccountBroker
-    datadir = account_server.DATADIR
-    default_port = 6002
+    brokerclass = AccountBroker
+    datadir = DATADIR
+    default_port = 6202

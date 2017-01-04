@@ -4,9 +4,9 @@ The Rings
 
 The rings determine where data should reside in the cluster. There is a
 separate ring for account databases, container databases, and individual
-objects but each ring works in the same way. These rings are externally
-managed, in that the server processes themselves do not modify the rings, they
-are instead given new rings modified by other tools.
+object storage policies but each ring works in the same way. These rings are
+externally managed, in that the server processes themselves do not modify the
+rings, they are instead given new rings modified by other tools.
 
 The ring uses a configurable number of bits from a path's MD5 hash as a
 partition index that designates a device. The number of bits kept from the hash
@@ -18,10 +18,25 @@ cluster all at once.
 
 Another configurable value is the replica count, which indicates how many of
 the partition->device assignments comprise a single ring. For a given partition
-number, each replica's device will not be in the same zone as any other
-replica's device. Zones can be used to group devices based on physical
-locations, power separations, network separations, or any other attribute that
-would lessen multiple replicas being unavailable at the same time.
+number, each replica will be assigned to a different device in the ring.
+
+Devices are added to the ring to describe the capacity available for
+part-replica assignment.  Devices are placed into failure domains consisting
+of region, zone, and server.  Regions can be used to describe geographical
+systems characterized by lower-bandwidth or higher latency between machines in
+different regions.  Many rings will consist of only a single region.  Zones
+can be used to group devices based on physical locations, power separations,
+network separations, or any other attribute that would lessen multiple
+replicas being unavailable at the same time.
+
+Devices are given a weight which describes relative weight of the device in
+comparison to other devices.
+
+When building a ring all of each part's replicas will be assigned to devices
+according to their weight.  Additionally, each replica of a part will attempt
+to be assigned to a device who's failure domain does not already have a
+replica for the part.  Only a single replica of a part may be assigned to each
+device - you must have as many devices as replicas.
 
 ------------
 Ring Builder
@@ -65,7 +80,8 @@ the list of devices is a dictionary with the following keys:
 
 ======  =======  ==============================================================
 id      integer  The index into the list devices.
-zone    integer  The zone the devices resides in.
+zone    integer  The zone the device resides in.
+region  integer  The region the zone resides in.
 weight  float    The relative weight of the device in comparison to other
                  devices. This usually corresponds directly to the amount of
                  disk space the device has compared to other devices. For
@@ -75,7 +91,7 @@ weight  float    The relative weight of the device in comparison to other
                  back into balance a device that has ended up with more or less
                  data than desired over time. A good average weight of 100.0
                  allows flexibility in lowering the weight later if necessary.
-ip      string   The IP address of the server containing the device.
+ip      string   The IP address or hostname of the server containing the device.
 port    int      The TCP port the listening server process uses that serves
                  requests for the device.
 device  string   The on disk name of the device on the server.
@@ -88,19 +104,22 @@ meta    string   A general-use field for storing additional information for the
 ======  =======  ==============================================================
 
 Note: The list of devices may contain holes, or indexes set to None, for
-devices that have been removed from the cluster. Generally, device ids are not
-reused. Also, some devices may be temporarily disabled by setting their weight
-to 0.0. To obtain a list of active devices (for uptime polling, for example)
-the Python code would look like: ``devices = [device for device in self.devs if
-device and device['weight']]``
+devices that have been removed from the cluster. However, device ids are
+reused. Device ids are reused to avoid potentially running out of device id
+slots when there are available slots (from prior removal of devices). A
+consequence of this device id reuse is that the device id (integer value) does
+not necessarily correspond with the chronology of when the device was added to
+the ring. Also, some devices may be temporarily disabled by setting their
+weight to 0.0. To obtain a list of active devices (for uptime polling, for
+example) the Python code would look like: ``devices = list(self._iter_devs())``
 
 *************************
 Partition Assignment List
 *************************
 
-This is a list of array('I') of devices ids. The outermost list contains an
-array('I') for each replica. Each array('I') has a length equal to the
-partition count for the ring. Each integer in the array('I') is an index into
+This is a list of array('H') of devices ids. The outermost list contains an
+array('H') for each replica. Each array('H') has a length equal to the
+partition count for the ring. Each integer in the array('H') is an index into
 the above list of devices. The partition list is known internally to the Ring
 class as _replica2part2dev_id.
 
@@ -108,7 +127,7 @@ So, to create a list of device dictionaries assigned to a partition, the Python
 code would look like: ``devices = [self.devs[part2dev_id[partition]] for
 part2dev_id in self._replica2part2dev_id]``
 
-array('I') is used for memory conservation as there may be millions of
+array('H') is used for memory conservation as there may be millions of
 partitions.
 
 *********************
@@ -123,35 +142,192 @@ in this process. For example, to compute the partition for the path
 unpack_from('>I', md5('/account/container/object').digest())[0] >>
 self._part_shift``
 
+For a ring generated with part_power P, the partition shift value is
+32 - P.
+
+*******************
+Fractional Replicas
+*******************
+
+A ring is not restricted to having an integer number of replicas. In order to
+support the gradual changing of replica counts, the ring is able to have a real
+number of replicas.
+
+When the number of replicas is not an integer, then the last element of
+_replica2part2dev_id will have a length that is less than the partition count
+for the ring. This means that some partitions will have more replicas than
+others. For example, if a ring has 3.25 replicas, then 25% of its partitions
+will have four replicas, while the remaining 75% will have just three.
+
+.. _ring_dispersion:
+
+**********
+Dispersion
+**********
+
+With each rebalance, the ring builder calculates a dispersion metric. This is
+the percentage of partitions in the ring that have too many replicas within a
+particular failure domain.
+
+For example, if you have three servers in a cluster but two replicas for a
+partition get placed onto the same server, that partition will count towards
+the dispersion metric.
+
+A lower dispersion value is better, and the value can be used to find the
+proper value for "overload".
+
+.. _ring_overload:
+
+********
+Overload
+********
+
+The ring builder tries to keep replicas as far apart as possible while
+still respecting device weights. When it can't do both, the overload
+factor determines what happens. Each device will take some extra
+fraction of its desired partitions to allow for replica dispersion;
+once that extra fraction is exhausted, replicas will be placed closer
+together than optimal.
+
+Essentially, the overload factor lets the operator trade off replica
+dispersion (durability) against data dispersion (uniform disk usage).
+
+The default overload factor is 0, so device weights will be strictly
+followed.
+
+With an overload factor of 0.1, each device will accept 10% more
+partitions than it otherwise would, but only if needed to maintain
+partition dispersion.
+
+Example: Consider a 3-node cluster of machines with equal-size disks;
+let node A have 12 disks, node B have 12 disks, and node C have only
+11 disks. Let the ring have an overload factor of 0.1 (10%).
+
+Without the overload, some partitions would end up with replicas only
+on nodes A and B. However, with the overload, every device is willing
+to accept up to 10% more partitions for the sake of dispersion. The
+missing disk in C means there is one disk's worth of partitions that
+would like to spread across the remaining 11 disks, which gives each
+disk in C an extra 9.09% load. Since this is less than the 10%
+overload, there is one replica of each partition on each node.
+
+However, this does mean that the disks in node C will have more data
+on them than the disks in nodes A and B. If 80% full is the warning
+threshold for the cluster, node C's disks will reach 80% full while A
+and B's disks are only 72.7% full.
+
+-------------------------------
+Partition & Replica Terminology
+-------------------------------
+
+All descriptions of consistent hashing describe the process of breaking the
+keyspace up into multiple ranges (vnodes, buckets, etc.) - many more than the
+number of "nodes" to which keys in the keyspace must be assigned.  Swift calls
+these ranges `partitions` - they are partitions of the total keyspace.
+
+Each partition will have multiple replicas.  Every replica of each partition
+must be assigned to a device in the ring.  When a describing a specific
+replica of a partition (like when it's assigned a device) it is described as a
+`part-replica` in that it is a specific `replica` of the specific `partition`.
+A single device may be assigned different replicas from many parts, but it may
+not be assigned multiple replicas of a single part.
+
+The total number of partitions in a ring is calculated as ``2 **
+<part-power>``.  The total number of part-replicas in a ring is calculated as
+``<replica-count> * 2 ** <part-power>``.
+
+When considering a device's `weight` it is useful to describe the number of
+part-replicas it would like to be assigned.  A single device regardless of
+weight will never hold more than ``2 ** <part-power>`` part-replicas because
+it can not have more than one replica of any part assigned.  The number of
+part-replicas a device can take by weights is calculated as it's
+`parts_wanted`.  The true number of part-replicas assigned to a device can be
+compared to it's parts wanted similarly to a calculation of percentage error -
+this deviation in the observed result from the idealized target is called a
+devices `balance`.
+
+When considering a device's `failure domain` it is useful to describe the
+number of part-replicas it would like to be assigned.  The number of
+part-replicas wanted in a failure domain of a tier is the sum of the
+part-replicas wanted in the failure domains of it's sub-tier.  However,
+collectively when the total number of part-replicas in a failure domain
+exceeds or is equal to ``2 ** <part-power>`` it is most obvious that it's no
+longer sufficient to consider only the number of total part-replicas, but
+rather the fraction of each replica's partitions.  Consider for example a ring
+with ``3`` replicas and ``3`` servers, while it's necessary for dispersion
+that each server hold only ``1/3`` of the total part-replicas it is
+additionally constrained to require ``1.0`` replica of *each* partition.  It
+would not be sufficient to satisfy dispersion if two devices on one of the
+servers each held a replica of a single partition, while another server held
+none.  By considering a decimal fraction of one replica's worth of parts in a
+failure domain we can derive the total part-replicas wanted in a failure
+domain (``1.0 * 2 ** <part-power>``).  Additionally we infer more about
+`which` part-replicas must go in the failure domain.  Consider a ring with
+three replicas, and two zones, each with two servers (four servers total).
+The three replicas worth of partitions will be assigned into two failure
+domains at the zone tier.  Each zone must hold more than one replica of some
+parts.  We represent this improper faction of a replica's worth of partitions
+in decimal form as ``1.5`` (``3.0 / 2``).  This tells us not only the *number*
+of total parts (``1.5 * 2 ** <part-power>``) but also that *each* partition
+must have `at least` one replica in this failure domain (in fact ``0.5`` of
+the partitions will have ``2`` replicas).  Within each zone the two servers
+will hold ``0.75`` of a replica's worth of partitions - this is equal both to
+"the fraction of a replica's worth of partitions assigned to each zone
+(``1.5``) divided evenly among the number of failure domain's in it's sub-tier
+(``2`` servers in each zone, i.e.  ``1.5 / 2``)" but *also* "the total number
+of replicas (``3.0``) divided evenly among the total number of failure domains
+in the server tier (``2`` servers x ``2`` zones = ``4``, i.e.  ``3.0 / 4``)".
+It is useful to consider that each server in this ring will hold only ``0.75``
+of a replica's worth of partitions which tells that any server should have `at
+most` one replica of a given part assigned.  In the interests of brevity, some
+variable names will often refer to the concept representing the fraction of a
+replica's worth of partitions in decimal form as *replicanths* - this is meant
+to invoke connotations similar to ordinal numbers as applied to fractions, but
+generalized to a replica instead of four*th* or a fif*th*.  The 'n' was
+probably thrown in because of Blade Runner.
+
 -----------------
 Building the Ring
 -----------------
 
-The initial building of the ring first calculates the number of partitions that
-should ideally be assigned to each device based the device's weight. For
-example, if the partition power of 20 the ring will have 1,048,576 partitions.
-If there are 1,000 devices of equal weight they will each desire 1,048.576
-partitions. The devices are then sorted by the number of partitions they desire
-and kept in order throughout the initialization process.
+First the ring builder calculates the replicanths wanted at each tier in the
+ring's topology based on weight.
 
-Then, the ring builder assigns each replica of each partition to the device
-that desires the most partitions at that point while keeping it as far away as
-possible from other replicas. The ring builder prefers to assign a replica to a
-device in a zone that has no replicas already; should there be no such zone
-available, the ring builder will try to find a device on a different server;
-failing that, it will just look for a device that has no replicas; finally, if
-all other options are exhausted, the ring builder will assign the replica to
-the device that has the fewest replicas already assigned.
+Then the ring builder calculates the replicanths wanted at each tier in the
+ring's topology based on dispersion.
 
-When building a new ring based on an old ring, the desired number of partitions
-each device wants is recalculated. Next the partitions to be reassigned are
-gathered up. Any removed devices have all their assigned partitions unassigned
-and added to the gathered list. Any partition replicas that (due to the
-addition of new devices) can be spread out for better durability are unassigned
-and added to the gathered list. Any devices that have more partitions than they
-now desire have random partitions unassigned from them and added to the
-gathered list. Lastly, the gathered partitions are then reassigned to devices
-using a similar method as in the initial assignment described above.
+Then the ring calculates the maximum deviation on a single device between it's
+weighted replicanths and wanted replicanths.
+
+Next we interpolate between the two replicanth values (weighted & wanted) at
+each tier using the specified overload (up to the maximum required overload).
+It's a linear interpolation, similar to solving for a point on a line between
+two points - we calculate the slope across the max required overload and then
+calculate the intersection of the line with the desired overload.  This
+becomes the target.
+
+From the target we calculate the minimum and maximum number of replicas any
+part may have in a tier.  This becomes the replica_plan.
+
+Finally, we calculate the number of partitions that should ideally be assigned
+to each device based the replica_plan.
+
+On initial balance, the first time partitions are placed to generate a ring,
+we must assign each replica of each partition to the device that desires the
+most partitions excluding any devices that already have their maximum number
+of replicas of that part assigned to some parent tier of that device's failure
+domain.
+
+When building a new ring based on an old ring, the desired number of
+partitions each device wants is recalculated from the current replica_plan.
+Next the partitions to be reassigned are gathered up. Any removed devices have
+all their assigned partitions unassigned and added to the gathered list. Any
+partition replicas that (due to the addition of new devices) can be spread out
+for better durability are unassigned and added to the gathered list. Any
+devices that have more partitions than they now desire have random partitions
+unassigned from them and added to the gathered list. Lastly, the gathered
+partitions are then reassigned to devices using a similar method as in the
+initial assignment described above.
 
 Whenever a partition has a replica reassigned, the time of the reassignment is
 recorded. This is taken into account when gathering partitions to reassign so
@@ -163,18 +339,23 @@ failure and there's no choice but to make a reassignment.
 
 The above processes don't always perfectly rebalance a ring due to the random
 nature of gathering partitions for reassignment. To help reach a more balanced
-ring, the rebalance process is repeated until near perfect (less 1% off) or
-when the balance doesn't improve by at least 1% (indicating we probably can't
-get perfect balance due to wildly imbalanced zones or too many partitions
-recently moved).
+ring, the rebalance process is repeated a fixed number of times until the
+replica_plan is fulfilled or unable to be fulfilled (indicating we probably
+can't get perfect balance due to too many partitions recently moved).
+
+---------------------
+Ring Builder Analyzer
+---------------------
+.. automodule:: swift.cli.ring_builder_analyzer
+
 
 -------
 History
 -------
 
 The ring code went through many iterations before arriving at what it is now
-and while it has been stable for a while now, the algorithm may be tweaked or
-perhaps even fundamentally changed if new ideas emerge. This section will try
+and while it has largely been stable, the algorithm has seen a few tweaks or
+perhaps even fundamentally changed as new ideas emerge. This section will try
 to describe the previous ideas attempted and attempt to explain why they were
 discarded.
 
@@ -206,7 +387,7 @@ were determined by "walking" the ring until finding additional devices in other
 zones. This was discarded as control was lost as to how many replicas for a
 given partition moved at once. Keeping each replica independent allows for
 moving only one partition replica within a given time window (except due to
-device failures). Using the additional memory was deemed a good tradeoff for
+device failures). Using the additional memory was deemed a good trade-off for
 moving data around the cluster much less often.
 
 Another ring design was tried where the partition to device assignments weren't
@@ -237,3 +418,18 @@ faster, but MD5 was built-in and hash computation is a small percentage of the
 overall request handling time. In all, once it was decided the servers wouldn't
 be maintaining the rings themselves anyway and only doing hash lookups, MD5 was
 chosen for its general availability, good distribution, and adequate speed.
+
+The placement algorithm has seen a number of behavioral changes for
+unbalanceable rings. The ring builder wants to keep replicas as far apart as
+possible while still respecting device weights. In most cases, the ring
+builder can achieve both, but sometimes they conflict.  At first, the behavior
+was to keep the replicas far apart and ignore device weight, but that made it
+impossible to gradually go from one region to two, or from two to three. Then
+it was changed to favor device weight over dispersion, but that wasn't so good
+for rings that were close to balanceable, like 3 machines with 60TB, 60TB, and
+57TB of disk space; operators were expecting one replica per machine, but
+didn't always get it. After that, overload was added to the ring builder so
+that operators could choose a balance between dispersion and device weights.
+In time the overload concept was improved and made more accurate.
+
+For more background on consistent hashing rings, please see :doc:`ring_background`.

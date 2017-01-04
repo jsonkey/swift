@@ -1,4 +1,4 @@
-# Copyright (c) 2010-2012 OpenStack, LLC.
+# Copyright (c) 2010-2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import with_statement
+from __future__ import print_function
 import functools
 import errno
 import os
@@ -22,32 +22,40 @@ import signal
 import time
 import subprocess
 import re
+from swift import gettext_ as _
 
 from swift.common.utils import search_tree, remove_file, write_file
+from swift.common.exceptions import InvalidPidFileException
 
 SWIFT_DIR = '/etc/swift'
 RUN_DIR = '/var/run/swift'
+PROC_DIR = '/proc'
 
 # auth-server has been removed from ALL_SERVERS, start it explicitly
 ALL_SERVERS = ['account-auditor', 'account-server', 'container-auditor',
-               'container-replicator', 'container-server', 'container-sync',
+               'container-replicator', 'container-reconciler',
+               'container-server', 'container-sync',
                'container-updater', 'object-auditor', 'object-server',
-               'object-expirer', 'object-replicator', 'object-updater',
+               'object-expirer', 'object-replicator',
+               'object-reconstructor', 'object-updater',
                'proxy-server', 'account-replicator', 'account-reaper']
 MAIN_SERVERS = ['proxy-server', 'account-server', 'container-server',
                 'object-server']
 REST_SERVERS = [s for s in ALL_SERVERS if s not in MAIN_SERVERS]
+# aliases mapping
+ALIASES = {'all': ALL_SERVERS, 'main': MAIN_SERVERS, 'rest': REST_SERVERS}
 GRACEFUL_SHUTDOWN_SERVERS = MAIN_SERVERS + ['auth-server']
 START_ONCE_SERVERS = REST_SERVERS
 # These are servers that match a type (account-*, container-*, object-*) but
 # don't use that type-server.conf file and instead use their own.
-STANDALONE_SERVERS = ['object-expirer']
+STANDALONE_SERVERS = ['object-expirer', 'container-reconciler']
 
-KILL_WAIT = 15  # seconds to wait for servers to die
+KILL_WAIT = 15  # seconds to wait for servers to die (by default)
 WARNING_WAIT = 3  # seconds to wait after message that may just be a warning
 
 MAX_DESCRIPTORS = 32768
 MAX_MEMORY = (1024 * 1024 * 1024) * 2  # 2 GB
+MAX_PROCS = 8192  # workers * disks, can get high
 
 
 def setup_env():
@@ -56,13 +64,26 @@ def setup_env():
     try:
         resource.setrlimit(resource.RLIMIT_NOFILE,
                            (MAX_DESCRIPTORS, MAX_DESCRIPTORS))
+    except ValueError:
+        print(_("WARNING: Unable to modify file descriptor limit.  "
+                "Running as non-root?"))
+
+    try:
         resource.setrlimit(resource.RLIMIT_DATA,
                            (MAX_MEMORY, MAX_MEMORY))
     except ValueError:
-        print _("WARNING: Unable to increase file descriptor limit.  "
-                "Running as non-root?")
+        print(_("WARNING: Unable to modify memory limit.  "
+                "Running as non-root?"))
 
-    os.environ['PYTHON_EGG_CACHE'] = '/tmp'
+    try:
+        resource.setrlimit(resource.RLIMIT_NPROC,
+                           (MAX_PROCS, MAX_PROCS))
+    except ValueError:
+        print(_("WARNING: Unable to modify max process limit.  "
+                "Running as non-root?"))
+
+    # Set PYTHON_EGG_CACHE if it isn't already set
+    os.environ.setdefault('PYTHON_EGG_CACHE', '/tmp')
 
 
 def command(func):
@@ -82,7 +103,7 @@ def command(func):
 
 
 def watch_server_pids(server_pids, interval=1, **kwargs):
-    """Monitor a collection of server pids yeilding back those pids that
+    """Monitor a collection of server pids yielding back those pids that
     aren't responding to signals.
 
     :param server_pids: a dict, lists of pids [int,...] keyed on
@@ -98,7 +119,7 @@ def watch_server_pids(server_pids, interval=1, **kwargs):
                 try:
                     # let pid stop if it wants to
                     os.waitpid(pid, os.WNOHANG)
-                except OSError, e:
+                except OSError as e:
                     if e.errno not in (errno.ECHILD, errno.ESRCH):
                         raise  # else no such child/process
             # check running pids for server
@@ -118,36 +139,72 @@ def watch_server_pids(server_pids, interval=1, **kwargs):
             time.sleep(0.1)
 
 
+def safe_kill(pid, sig, name):
+    """Send signal to process and check process name
+
+    : param pid: process id
+    : param sig: signal to send
+    : param name: name to ensure target process
+    """
+
+    # check process name for SIG_DFL
+    if sig == signal.SIG_DFL:
+        try:
+            proc_file = '%s/%d/cmdline' % (PROC_DIR, pid)
+            if os.path.exists(proc_file):
+                with open(proc_file, 'r') as fd:
+                    if name not in fd.read():
+                        # unknown process is using the pid
+                        raise InvalidPidFileException()
+        except IOError:
+            pass
+
+    os.kill(pid, sig)
+
+
+def kill_group(pid, sig):
+    """Send signal to process group
+
+    : param pid: process id
+    : param sig: signal to send
+    """
+    # Negative PID means process group
+    os.kill(-pid, sig)
+
+
 class UnknownCommandError(Exception):
     pass
 
 
-class Manager():
+class Manager(object):
     """Main class for performing commands on groups of servers.
 
     :param servers: list of server names as strings
 
     """
 
-    def __init__(self, servers):
-        server_names = set()
+    def __init__(self, servers, run_dir=RUN_DIR):
+        self.server_names = set()
+        self._default_strict = True
         for server in servers:
-            if server == 'all':
-                server_names.update(ALL_SERVERS)
-            elif server == 'main':
-                server_names.update(MAIN_SERVERS)
-            elif server == 'rest':
-                server_names.update(REST_SERVERS)
+            if server in ALIASES:
+                self.server_names.update(ALIASES[server])
+                self._default_strict = False
             elif '*' in server:
                 # convert glob to regex
-                server_names.update([s for s in ALL_SERVERS if
-                                     re.match(server.replace('*', '.*'), s)])
+                self.server_names.update([
+                    s for s in ALL_SERVERS if
+                    re.match(server.replace('*', '.*'), s)])
+                self._default_strict = False
             else:
-                server_names.add(server)
+                self.server_names.add(server)
 
         self.servers = set()
-        for name in server_names:
-            self.servers.add(Server(name))
+        for name in self.server_names:
+            self.servers.add(Server(name, run_dir))
+
+    def __iter__(self):
+        return iter(self.servers)
 
     @command
     def status(self, **kwargs):
@@ -165,14 +222,23 @@ class Manager():
         setup_env()
         status = 0
 
+        strict = kwargs.get('strict')
+        # if strict not set explicitly
+        if strict is None:
+            strict = self._default_strict
+
         for server in self.servers:
-            server.launch(**kwargs)
+            status += 0 if server.launch(**kwargs) else 1
+
+        if not strict:
+            status = 0
+
         if not kwargs.get('daemon', True):
             for server in self.servers:
                 try:
                     status += server.interact(**kwargs)
                 except KeyboardInterrupt:
-                    print _('\nuser quit')
+                    print(_('\nuser quit'))
                     self.stop(**kwargs)
                     break
         elif kwargs.get('wait', True):
@@ -209,7 +275,7 @@ class Manager():
         for server in self.servers:
             signaled_pids = server.stop(**kwargs)
             if not signaled_pids:
-                print _('No %s running') % server
+                print(_('No %s running') % server)
             else:
                 server_pids[server] = signaled_pids
 
@@ -218,22 +284,55 @@ class Manager():
                          for p in pids]
         # keep track of the pids yeiled back as killed for all servers
         killed_pids = set()
+        kill_wait = kwargs.get('kill_wait', KILL_WAIT)
         for server, killed_pid in watch_server_pids(server_pids,
-                                                    interval=KILL_WAIT,
+                                                    interval=kill_wait,
                                                     **kwargs):
-            print _("%s (%s) appears to have stopped") % (server, killed_pid)
+            print(_("%(server)s (%(pid)s) appears to have stopped") %
+                  {'server': server, 'pid': killed_pid})
             killed_pids.add(killed_pid)
             if not killed_pids.symmetric_difference(signaled_pids):
-                # all proccesses have been stopped
+                # all processes have been stopped
                 return 0
 
         # reached interval n watch_pids w/o killing all servers
+        kill_after_timeout = kwargs.get('kill_after_timeout', False)
         for server, pids in server_pids.items():
             if not killed_pids.issuperset(pids):
                 # some pids of this server were not killed
-                print _('Waited %s seconds for %s to die; giving up') % (
-                    KILL_WAIT, server)
+                if kill_after_timeout:
+                    print(_('Waited %(kill_wait)s seconds for %(server)s '
+                            'to die; killing') %
+                          {'kill_wait': kill_wait, 'server': server})
+                    # Send SIGKILL to all remaining pids
+                    for pid in set(pids.keys()) - killed_pids:
+                        print(_('Signal %(server)s  pid: %(pid)s  signal: '
+                                '%(signal)s') % {'server': server,
+                                                 'pid': pid,
+                                                 'signal': signal.SIGKILL})
+                        # Send SIGKILL to process group
+                        try:
+                            kill_group(pid, signal.SIGKILL)
+                        except OSError as e:
+                            # PID died before kill_group can take action?
+                            if e.errno != errno.ESRCH:
+                                raise
+                else:
+                    print(_('Waited %(kill_wait)s seconds for %(server)s '
+                            'to die; giving up') %
+                          {'kill_wait': kill_wait, 'server': server})
         return 1
+
+    @command
+    def kill(self, **kwargs):
+        """stop a server (no error if not running)
+        """
+        status = self.stop(**kwargs)
+        kwargs['quiet'] = True
+        if status and not self.status(**kwargs):
+            # only exit error if the server is still running
+            return status
+        return 0
 
     @command
     def shutdown(self, **kwargs):
@@ -259,8 +358,8 @@ class Manager():
         """
         kwargs['graceful'] = True
         status = 0
-        for server in self.servers:
-            m = Manager([server.server])
+        for server in self.server_names:
+            m = Manager([server])
             status += m.stop(**kwargs)
             status += m.start(**kwargs)
         return status
@@ -279,9 +378,8 @@ class Manager():
 
         """
         cmd = cmd.lower().replace('-', '_')
-        try:
-            f = getattr(self, cmd)
-        except AttributeError:
+        f = getattr(self, cmd, None)
+        if f is None:
             raise UnknownCommandError(cmd)
         if not hasattr(f, 'publicly_accessible'):
             raise UnknownCommandError(cmd)
@@ -309,19 +407,24 @@ class Manager():
         return f(**kwargs)
 
 
-class Server():
+class Server(object):
     """Manage operations on a server or group of servers of similar type
 
     :param server: name of server
     """
 
-    def __init__(self, server):
-        if '-' not in server:
-            server = '%s-server' % server
+    def __init__(self, server, run_dir=RUN_DIR):
         self.server = server.lower()
-        self.type = server.rsplit('-', 1)[0]
-        self.cmd = 'swift-%s' % server
+        if '.' in self.server:
+            self.server, self.conf = self.server.rsplit('.', 1)
+        else:
+            self.conf = None
+        if '-' not in self.server:
+            self.server = '%s-server' % self.server
+        self.type = self.server.rsplit('-', 1)[0]
+        self.cmd = 'swift-%s' % self.server
         self.procs = []
+        self.run_dir = run_dir
 
     def __str__(self):
         return self.server
@@ -338,6 +441,9 @@ class Server():
         except AttributeError:
             return False
 
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
     def get_pid_file_name(self, conf_file):
         """Translate conf_file to a corresponding pid_file
 
@@ -347,9 +453,9 @@ class Server():
 
         """
         return conf_file.replace(
-            os.path.normpath(SWIFT_DIR), RUN_DIR, 1).replace(
-                '%s-server' % self.type, self.server, 1).rsplit(
-                    '.conf', 1)[0] + '.pid'
+            os.path.normpath(SWIFT_DIR), self.run_dir, 1).replace(
+                '%s-server' % self.type, self.server, 1).replace(
+                    '.conf', '.pid', 1)
 
     def get_conf_file_name(self, pid_file):
         """Translate pid_file to a corresponding conf_file
@@ -361,13 +467,13 @@ class Server():
         """
         if self.server in STANDALONE_SERVERS:
             return pid_file.replace(
-                os.path.normpath(RUN_DIR), SWIFT_DIR, 1)\
-                .rsplit('.pid', 1)[0] + '.conf'
+                os.path.normpath(self.run_dir), SWIFT_DIR, 1).replace(
+                    '.pid', '.conf', 1)
         else:
             return pid_file.replace(
-                os.path.normpath(RUN_DIR), SWIFT_DIR, 1).replace(
-                    self.server, '%s-server' % self.type, 1).rsplit(
-                        '.pid', 1)[0] + '.conf'
+                os.path.normpath(self.run_dir), SWIFT_DIR, 1).replace(
+                    self.server, '%s-server' % self.type, 1).replace(
+                        '.pid', '.conf', 1)
 
     def conf_files(self, **kwargs):
         """Get conf files for this server
@@ -377,11 +483,16 @@ class Server():
         :returns: list of conf files
         """
         if self.server in STANDALONE_SERVERS:
-            found_conf_files = search_tree(SWIFT_DIR, self.server + '*',
-                                           '.conf')
+            server_search = self.server
         else:
-            found_conf_files = search_tree(SWIFT_DIR, '%s-server*' % self.type,
-                                           '.conf')
+            server_search = "%s-server" % self.type
+        if self.conf is not None:
+            found_conf_files = search_tree(SWIFT_DIR, server_search,
+                                           self.conf + '.conf',
+                                           dir_ext=self.conf + '.conf.d')
+        else:
+            found_conf_files = search_tree(SWIFT_DIR, server_search + '*',
+                                           '.conf', dir_ext='.conf.d')
         number = kwargs.get('number')
         if number:
             try:
@@ -393,13 +504,17 @@ class Server():
         if not conf_files:
             # maybe there's a config file(s) out there, but I couldn't find it!
             if not kwargs.get('quiet'):
-                print _('Unable to locate config %sfor %s') % (
-                    ('number %s ' % number if number else ''), self.server)
+                if number:
+                    print(_('Unable to locate config number %(number)s for'
+                            ' %(server)s') %
+                          {'number': number, 'server': self.server})
+                else:
+                    print(_('Unable to locate config for %s') % self.server)
             if kwargs.get('verbose') and not kwargs.get('quiet'):
                 if found_conf_files:
-                    print _('Found configs:')
+                    print(_('Found configs:'))
                 for i, conf_file in enumerate(found_conf_files):
-                    print '  %d) %s' % (i + 1, conf_file)
+                    print('  %d) %s' % (i + 1, conf_file))
 
         return conf_files
 
@@ -410,7 +525,12 @@ class Server():
 
         :returns: list of pid files
         """
-        pid_files = search_tree(RUN_DIR, '%s*' % self.server, '.pid')
+        if self.conf is not None:
+            pid_files = search_tree(self.run_dir, '%s*' % self.server,
+                                    exts=[self.conf + '.pid',
+                                          self.conf + '.pid.d'])
+        else:
+            pid_files = search_tree(self.run_dir, '%s*' % self.server)
         if kwargs.get('number', 0):
             conf_files = self.conf_files(**kwargs)
             # filter pid_files to match the index of numbered conf_file
@@ -422,7 +542,11 @@ class Server():
         """Generator, yields (pid_file, pids)
         """
         for pid_file in self.pid_files(**kwargs):
-            yield pid_file, int(open(pid_file).read().strip())
+            try:
+                pid = int(open(pid_file).read().strip())
+            except ValueError:
+                pid = None
+            yield pid_file, pid
 
     def signal_pids(self, sig, **kwargs):
         """Send a signal to pids for this server
@@ -434,19 +558,29 @@ class Server():
         """
         pids = {}
         for pid_file, pid in self.iter_pid_files(**kwargs):
+            if not pid:  # Catches None and 0
+                print(_('Removing pid file %s with invalid pid') % pid_file)
+                remove_file(pid_file)
+                continue
             try:
                 if sig != signal.SIG_DFL:
-                    print _('Signal %s  pid: %s  signal: %s') % (self.server,
-                                                                 pid, sig)
-                os.kill(pid, sig)
-            except OSError, e:
+                    print(_('Signal %(server)s  pid: %(pid)s  signal: '
+                            '%(signal)s') %
+                          {'server': self.server, 'pid': pid, 'signal': sig})
+                safe_kill(pid, sig, 'swift-%s' % self.server)
+            except InvalidPidFileException as e:
+                if kwargs.get('verbose'):
+                    print(_('Removing pid file %(pid_file)s with wrong pid '
+                            '%(pid)d') % {'pid_file': pid_file, 'pid': pid})
+                remove_file(pid_file)
+            except OSError as e:
                 if e.errno == errno.ESRCH:
                     # pid does not exist
                     if kwargs.get('verbose'):
-                        print _("Removing stale pid file %s") % pid_file
+                        print(_("Removing stale pid file %s") % pid_file)
                     remove_file(pid_file)
                 elif e.errno == errno.EPERM:
-                    print _("No permission to signal PID %d") % pid
+                    print(_("No permission to signal PID %d") % pid)
             else:
                 # process exists
                 pids[pid] = pid_file
@@ -491,14 +625,16 @@ class Server():
                 kwargs['quiet'] = True
                 conf_files = self.conf_files(**kwargs)
                 if conf_files:
-                    print _("%s #%d not running (%s)") % (self.server, number,
-                                                          conf_files[0])
+                    print(_("%(server)s #%(number)d not running (%(conf)s)") %
+                          {'server': self.server, 'number': number,
+                           'conf': conf_files[0]})
             else:
-                print _("No %s running") % self.server
+                print(_("No %s running") % self.server)
             return 1
         for pid, pid_file in pids.items():
             conf_file = self.get_conf_file_name(pid_file)
-            print _("%s running (%s - %s)") % (self.server, pid, conf_file)
+            print(_("%(server)s running (%(pid)s - %(conf)s)") %
+                  {'server': self.server, 'pid': pid, 'conf': conf_file})
         return 0
 
     def spawn(self, conf_file, once=False, wait=True, daemon=True, **kwargs):
@@ -507,9 +643,9 @@ class Server():
         :param conf_file: path to conf_file to use as first arg
         :param once: boolean, add once argument to command
         :param wait: boolean, if true capture stdout with a pipe
-        :param daemon: boolean, if true ask server to log to console
+        :param daemon: boolean, if false ask server to log to console
 
-        :returns : the pid of the spawned process
+        :returns: the pid of the spawned process
         """
         args = [self.cmd, conf_file]
         if once:
@@ -544,8 +680,13 @@ class Server():
         for proc in self.procs:
             # wait for process to close its stdout
             output = proc.stdout.read()
+            if kwargs.get('once', False):
+                # if you don't want once to wait you can send it to the
+                # background on the command line, I generally just run with
+                # no-daemon anyway, but this is quieter
+                proc.wait()
             if output:
-                print output
+                print(output)
                 start = time.time()
                 # wait for process to die (output may just be a warning)
                 while time.time() - start < WARNING_WAIT:
@@ -573,7 +714,7 @@ class Server():
         """
         conf_files = self.conf_files(**kwargs)
         if not conf_files:
-            return []
+            return {}
 
         pids = self.get_running_pids(**kwargs)
 
@@ -586,14 +727,17 @@ class Server():
             # any unstarted instances
             if conf_file in conf_files:
                 already_started = True
-                print _("%s running (%s - %s)") % (self.server, pid, conf_file)
+                print(_("%(server)s running (%(pid)s - %(conf)s)") %
+                      {'server': self.server, 'pid': pid, 'conf': conf_file})
             elif not kwargs.get('number', 0):
                 already_started = True
-                print _("%s running (%s - %s)") % (self.server, pid, pid_file)
+                print(_("%(server)s running (%(pid)s - %(pid_file)s)") %
+                      {'server': self.server, 'pid': pid,
+                       'pid_file': pid_file})
 
         if already_started:
-            print _("%s already started...") % self.server
-            return []
+            print(_("%s already started...") % self.server)
+            return {}
 
         if self.server not in START_ONCE_SERVERS:
             kwargs['once'] = False
@@ -604,14 +748,16 @@ class Server():
                 msg = _('Running %s once') % self.server
             else:
                 msg = _('Starting %s') % self.server
-            print '%s...(%s)' % (msg, conf_file)
+            print('%s...(%s)' % (msg, conf_file))
             try:
                 pid = self.spawn(conf_file, **kwargs)
-            except OSError, e:
+            except OSError as e:
                 if e.errno == errno.ENOENT:
-                    # TODO: should I check if self.cmd exists earlier?
-                    print _("%s does not exist") % self.cmd
+                    # TODO(clayg): should I check if self.cmd exists earlier?
+                    print(_("%s does not exist") % self.cmd)
                     break
+                else:
+                    raise
             pids[pid] = conf_file
 
         return pids

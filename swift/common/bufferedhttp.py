@@ -1,4 +1,4 @@
-# Copyright (c) 2010-2012 OpenStack, LLC.
+# Copyright (c) 2010-2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,12 +26,23 @@ BufferedHTTPResponse.
     make all calls through httplib.
 """
 
-from urllib import quote
+from swift import gettext_ as _
+from swift.common import constraints
 import logging
 import time
+import socket
 
+import eventlet
 from eventlet.green.httplib import CONTINUE, HTTPConnection, HTTPMessage, \
     HTTPResponse, HTTPSConnection, _UNKNOWN
+from six.moves.urllib.parse import quote
+import six
+
+if six.PY2:
+    httplib = eventlet.import_patched('httplib')
+else:
+    httplib = eventlet.import_patched('http.client')
+httplib._MAXHEADERS = constraints.MAX_HEADER_COUNT
 
 
 class BufferedHTTPResponse(HTTPResponse):
@@ -40,6 +51,10 @@ class BufferedHTTPResponse(HTTPResponse):
     def __init__(self, sock, debuglevel=0, strict=0,
                  method=None):          # pragma: no cover
         self.sock = sock
+        # sock is an eventlet.greenio.GreenSocket
+        # sock.fd is a socket._socketobject
+        # sock.fd._sock is a socket._socket object, which is what we want.
+        self._real_socket = sock.fd._sock
         self.fp = sock.makefile('rb')
         self.debuglevel = debuglevel
         self.strict = strict
@@ -56,6 +71,7 @@ class BufferedHTTPResponse(HTTPResponse):
         self.chunk_left = _UNKNOWN      # bytes left to read in current chunk
         self.length = _UNKNOWN          # number of bytes left in response
         self.will_close = _UNKNOWN      # conn will close at end of response
+        self._readline_buffer = ''
 
     def expect_response(self):
         if self.fp:
@@ -73,9 +89,67 @@ class BufferedHTTPResponse(HTTPResponse):
             self.msg = HTTPMessage(self.fp, 0)
             self.msg.fp = None
 
+    def read(self, amt=None):
+        if not self._readline_buffer:
+            return HTTPResponse.read(self, amt)
+
+        if amt is None:
+            # Unbounded read: send anything we have buffered plus whatever
+            # is left.
+            buffered = self._readline_buffer
+            self._readline_buffer = ''
+            return buffered + HTTPResponse.read(self, amt)
+        elif amt <= len(self._readline_buffer):
+            # Bounded read that we can satisfy entirely from our buffer
+            res = self._readline_buffer[:amt]
+            self._readline_buffer = self._readline_buffer[amt:]
+            return res
+        else:
+            # Bounded read that wants more bytes than we have
+            smaller_amt = amt - len(self._readline_buffer)
+            buf = self._readline_buffer
+            self._readline_buffer = ''
+            return buf + HTTPResponse.read(self, smaller_amt)
+
+    def readline(self, size=1024):
+        # You'd think Python's httplib would provide this, but it doesn't.
+        # It does, however, provide a comment in the HTTPResponse class:
+        #
+        #  # XXX It would be nice to have readline and __iter__ for this,
+        #  # too.
+        #
+        # Yes, it certainly would.
+        while ('\n' not in self._readline_buffer
+               and len(self._readline_buffer) < size):
+            read_size = size - len(self._readline_buffer)
+            chunk = HTTPResponse.read(self, read_size)
+            if not chunk:
+                break
+            self._readline_buffer += chunk
+
+        line, newline, rest = self._readline_buffer.partition('\n')
+        self._readline_buffer = rest
+        return line + newline
+
+    def nuke_from_orbit(self):
+        """
+        Terminate the socket with extreme prejudice.
+
+        Closes the underlying socket regardless of whether or not anyone else
+        has references to it. Use this when you are certain that nobody else
+        you care about has a reference to this socket.
+        """
+        if self._real_socket:
+            # this is idempotent; see sock_close in Modules/socketmodule.c in
+            # the Python source for details.
+            self._real_socket.close()
+        self._real_socket = None
+        self.close()
+
     def close(self):
         HTTPResponse.close(self)
         self.sock = None
+        self._real_socket = None
 
 
 class BufferedHTTPConnection(HTTPConnection):
@@ -84,7 +158,9 @@ class BufferedHTTPConnection(HTTPConnection):
 
     def connect(self):
         self._connected_time = time.time()
-        return HTTPConnection.connect(self)
+        ret = HTTPConnection.connect(self)
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        return ret
 
     def putrequest(self, method, url, skip_host=0, skip_accept_encoding=0):
         self._method = method
@@ -100,8 +176,8 @@ class BufferedHTTPConnection(HTTPConnection):
 
     def getresponse(self):
         response = HTTPConnection.getresponse(self)
-        logging.debug(_("HTTP PERF: %(time).5f seconds to %(method)s "
-                        "%(host)s:%(port)s %(path)s)"),
+        logging.debug("HTTP PERF: %(time).5f seconds to %(method)s "
+                      "%(host)s:%(port)s %(path)s)",
                       {'time': time.time() - self._connected_time,
                        'method': self._method, 'host': self.host,
                        'port': self.port, 'path': self._path})
@@ -126,27 +202,19 @@ def http_connect(ipaddr, port, device, partition, method, path,
     :param ssl: set True if SSL should be used (default: False)
     :returns: HTTPConnection object
     """
-    if not port:
-        port = 443 if ssl else 80
-    if ssl:
-        conn = HTTPSConnection('%s:%s' % (ipaddr, port))
-    else:
-        conn = BufferedHTTPConnection('%s:%s' % (ipaddr, port))
-    if isinstance(path, unicode):
+    if isinstance(path, six.text_type):
         try:
             path = path.encode("utf-8")
-        except UnicodeError:
-            pass   # what should I do?
+        except UnicodeError as e:
+            logging.exception(_('Error encoding to UTF-8: %s'), str(e))
+    if isinstance(device, six.text_type):
+        try:
+            device = device.encode("utf-8")
+        except UnicodeError as e:
+            logging.exception(_('Error encoding to UTF-8: %s'), str(e))
     path = quote('/' + device + '/' + str(partition) + path)
-    if query_string:
-        path += '?' + query_string
-    conn.path = path
-    conn.putrequest(method, path, skip_host=(headers and 'Host' in headers))
-    if headers:
-        for header, value in headers.iteritems():
-            conn.putheader(header, str(value))
-    conn.endheaders()
-    return conn
+    return http_connect_raw(
+        ipaddr, port, method, path, headers, query_string, ssl)
 
 
 def http_connect_raw(ipaddr, port, method, path, headers=None,
@@ -176,7 +244,7 @@ def http_connect_raw(ipaddr, port, method, path, headers=None,
     conn.path = path
     conn.putrequest(method, path, skip_host=(headers and 'Host' in headers))
     if headers:
-        for header, value in headers.iteritems():
+        for header, value in headers.items():
             conn.putheader(header, str(value))
     conn.endheaders()
     return conn

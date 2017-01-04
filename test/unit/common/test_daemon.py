@@ -1,4 +1,4 @@
-# Copyright (c) 2010-2012 OpenStack, LLC.
+# Copyright (c) 2010-2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,13 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# TODO: Test kill_children signal handlers
+# TODO(clayg): Test kill_children signal handlers
 
+import os
+from six import StringIO
+from six.moves import reload_module
 import unittest
 from getpass import getuser
 import logging
-from StringIO import StringIO
 from test.unit import tmpfile
+import mock
+import signal
 
 from swift.common import daemon, utils
 
@@ -49,8 +53,8 @@ class TestDaemon(unittest.TestCase):
 
     def test_create(self):
         d = daemon.Daemon({})
-        self.assertEquals(d.conf, {})
-        self.assert_(isinstance(d.logger, utils.LogAdapter))
+        self.assertEqual(d.conf, {})
+        self.assertTrue(isinstance(d.logger, utils.LogAdapter))
 
     def test_stubs(self):
         d = daemon.Daemon({})
@@ -62,11 +66,12 @@ class TestRunDaemon(unittest.TestCase):
 
     def setUp(self):
         utils.HASH_PATH_SUFFIX = 'endcap'
+        utils.HASH_PATH_PREFIX = 'startcap'
         utils.drop_privileges = lambda *args: None
         utils.capture_stdio = lambda *args: None
 
     def tearDown(self):
-        reload(utils)
+        reload_module(utils)
 
     def test_run(self):
         d = MyDaemon({})
@@ -74,34 +79,59 @@ class TestRunDaemon(unittest.TestCase):
         self.assertFalse(MyDaemon.once_called)
         # test default
         d.run()
-        self.assertEquals(d.forever_called, True)
+        self.assertEqual(d.forever_called, True)
         # test once
         d.run(once=True)
-        self.assertEquals(d.once_called, True)
+        self.assertEqual(d.once_called, True)
+
+    def test_signal(self):
+        d = MyDaemon({})
+        with mock.patch('swift.common.daemon.signal') as mock_signal:
+            mock_signal.SIGTERM = signal.SIGTERM
+            d.run()
+        signal_args, kwargs = mock_signal.signal.call_args
+        sig, func = signal_args
+        self.assertEqual(sig, signal.SIGTERM)
+        with mock.patch('swift.common.daemon.os') as mock_os:
+            func()
+        self.assertEqual(mock_os.method_calls, [
+            mock.call.killpg(0, signal.SIGTERM),
+            # hard exit because bare except handlers can trap SystemExit
+            mock.call._exit(0)
+        ])
 
     def test_run_daemon(self):
-        sample_conf = """[my-daemon]
-user = %s
-""" % getuser()
+        sample_conf = "[my-daemon]\nuser = %s\n" % getuser()
         with tmpfile(sample_conf) as conf_file:
-            daemon.run_daemon(MyDaemon, conf_file)
-            self.assertEquals(MyDaemon.forever_called, True)
+            with mock.patch.dict('os.environ', {'TZ': ''}):
+                daemon.run_daemon(MyDaemon, conf_file)
+                self.assertEqual(MyDaemon.forever_called, True)
+                self.assertTrue(os.environ['TZ'] is not '')
             daemon.run_daemon(MyDaemon, conf_file, once=True)
-            self.assertEquals(MyDaemon.once_called, True)
+            self.assertEqual(MyDaemon.once_called, True)
 
             # test raise in daemon code
-            MyDaemon.run_once = MyDaemon.run_raise
-            self.assertRaises(OSError, daemon.run_daemon, MyDaemon,
-                              conf_file, once=True)
+            with mock.patch.object(MyDaemon, 'run_once', MyDaemon.run_raise):
+                self.assertRaises(OSError, daemon.run_daemon, MyDaemon,
+                                  conf_file, once=True)
 
             # test user quit
-            MyDaemon.run_forever = MyDaemon.run_quit
             sio = StringIO()
             logger = logging.getLogger('server')
             logger.addHandler(logging.StreamHandler(sio))
             logger = utils.get_logger(None, 'server', log_route='server')
-            daemon.run_daemon(MyDaemon, conf_file, logger=logger)
-            self.assert_('user quit' in sio.getvalue().lower())
+            with mock.patch.object(MyDaemon, 'run_forever', MyDaemon.run_quit):
+                daemon.run_daemon(MyDaemon, conf_file, logger=logger)
+            self.assertTrue('user quit' in sio.getvalue().lower())
+
+            # test missing section
+            sample_conf = "[default]\nuser = %s\n" % getuser()
+            with tmpfile(sample_conf) as conf_file:
+                self.assertRaisesRegexp(SystemExit,
+                                        'Unable to find my-daemon '
+                                        'config section in.*',
+                                        daemon.run_daemon, MyDaemon,
+                                        conf_file, once=True)
 
 
 if __name__ == '__main__':

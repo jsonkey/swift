@@ -1,4 +1,4 @@
-# Copyright (c) 2010-2012 OpenStack, LLC.
+# Copyright (c) 2010-2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,9 +14,11 @@
 # limitations under the License.
 
 import os
-from ConfigParser import ConfigParser, NoSectionError, NoOptionError
 
-from swift.common.memcached import MemcacheRing
+from six.moves.configparser import ConfigParser, NoSectionError, NoOptionError
+
+from swift.common.memcached import (MemcacheRing, CONN_TIMEOUT, POOL_TIMEOUT,
+                                    IO_TIMEOUT, TRY_COUNT)
 
 
 class MemcacheMiddleware(object):
@@ -28,12 +30,28 @@ class MemcacheMiddleware(object):
         self.app = app
         self.memcache_servers = conf.get('memcache_servers')
         serialization_format = conf.get('memcache_serialization_support')
+        try:
+            # Originally, while we documented using memcache_max_connections
+            # we only accepted max_connections
+            max_conns = int(conf.get('memcache_max_connections',
+                                     conf.get('max_connections', 0)))
+        except ValueError:
+            max_conns = 0
 
-        if not self.memcache_servers or serialization_format is None:
+        memcache_options = {}
+        if (not self.memcache_servers
+                or serialization_format is None
+                or max_conns <= 0):
             path = os.path.join(conf.get('swift_dir', '/etc/swift'),
                                 'memcache.conf')
             memcache_conf = ConfigParser()
             if memcache_conf.read(path):
+                # if memcache.conf exists we'll start with those base options
+                try:
+                    memcache_options = dict(memcache_conf.items('memcache'))
+                except NoSectionError:
+                    pass
+
                 if not self.memcache_servers:
                     try:
                         self.memcache_servers = \
@@ -47,9 +65,30 @@ class MemcacheMiddleware(object):
                                               'memcache_serialization_support')
                     except (NoSectionError, NoOptionError):
                         pass
+                if max_conns <= 0:
+                    try:
+                        new_max_conns = \
+                            memcache_conf.get('memcache',
+                                              'memcache_max_connections')
+                        max_conns = int(new_max_conns)
+                    except (NoSectionError, NoOptionError, ValueError):
+                        pass
+
+        # while memcache.conf options are the base for the memcache
+        # middleware, if you set the same option also in the filter
+        # section of the proxy config it is more specific.
+        memcache_options.update(conf)
+        connect_timeout = float(memcache_options.get(
+            'connect_timeout', CONN_TIMEOUT))
+        pool_timeout = float(memcache_options.get(
+            'pool_timeout', POOL_TIMEOUT))
+        tries = int(memcache_options.get('tries', TRY_COUNT))
+        io_timeout = float(memcache_options.get('io_timeout', IO_TIMEOUT))
 
         if not self.memcache_servers:
             self.memcache_servers = '127.0.0.1:11211'
+        if max_conns <= 0:
+            max_conns = 2
         if serialization_format is None:
             serialization_format = 2
         else:
@@ -57,8 +96,13 @@ class MemcacheMiddleware(object):
 
         self.memcache = MemcacheRing(
             [s.strip() for s in self.memcache_servers.split(',') if s.strip()],
+            connect_timeout=connect_timeout,
+            pool_timeout=pool_timeout,
+            tries=tries,
+            io_timeout=io_timeout,
             allow_pickle=(serialization_format == 0),
-            allow_unpickle=(serialization_format <= 1))
+            allow_unpickle=(serialization_format <= 1),
+            max_conns=max_conns)
 
     def __call__(self, env, start_response):
         env['swift.cache'] = self.memcache

@@ -1,4 +1,4 @@
-# Copyright (c) 2010-2012 OpenStack, LLC.
+# Copyright (c) 2010-2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,44 +15,68 @@
 
 """Miscellaneous utility functions for use with Swift."""
 
+from __future__ import print_function
+
 import errno
 import fcntl
+import grp
+import hmac
+import json
+import math
+import operator
 import os
 import pwd
+import re
 import sys
 import time
+import uuid
 import functools
-from hashlib import md5
+import platform
+import email.parser
+from distutils.version import LooseVersion
+from hashlib import md5, sha1
 from random import random, shuffle
-from urllib import quote
 from contextlib import contextmanager, closing
 import ctypes
 import ctypes.util
-from ConfigParser import ConfigParser, NoSectionError, NoOptionError, \
-    RawConfigParser
 from optparse import OptionParser
+
 from tempfile import mkstemp, NamedTemporaryFile
-try:
-    import simplejson as json
-except ImportError:
-    import json
-import cPickle as pickle
 import glob
-from urlparse import urlparse as stdlib_urlparse, ParseResult
-import socket
 import itertools
-import types
+import stat
+import datetime
 
 import eventlet
-from eventlet import GreenPool, sleep, Timeout
+import eventlet.semaphore
+from eventlet import GreenPool, sleep, Timeout, tpool
 from eventlet.green import socket, threading
+import eventlet.queue
 import netifaces
 import codecs
 utf8_decoder = codecs.getdecoder('utf-8')
 utf8_encoder = codecs.getencoder('utf-8')
+import six
+from six.moves import cPickle as pickle
+from six.moves.configparser import (ConfigParser, NoSectionError,
+                                    NoOptionError, RawConfigParser)
+from six.moves import range
+from six.moves.urllib.parse import ParseResult
+from six.moves.urllib.parse import quote as _quote
+from six.moves.urllib.parse import urlparse as stdlib_urlparse
 
-from swift.common.exceptions import LockTimeout, MessageTimeout
-from swift.common.http import is_success, is_redirection, HTTP_NOT_FOUND
+from swift import gettext_ as _
+import swift.common.exceptions
+from swift.common.http import is_success, is_redirection, HTTP_NOT_FOUND, \
+    HTTP_PRECONDITION_FAILED, HTTP_REQUESTED_RANGE_NOT_SATISFIABLE
+from swift.common.header_key_dict import HeaderKeyDict
+from swift.common.linkat import linkat
+
+if six.PY3:
+    stdlib_queue = eventlet.patcher.original('queue')
+else:
+    stdlib_queue = eventlet.patcher.original('Queue')
+stdlib_threading = eventlet.patcher.original('threading')
 
 # logging doesn't import patched as cleanly as one would like
 from logging.handlers import SysLogHandler
@@ -62,25 +86,249 @@ logging.threading = eventlet.green.threading
 logging._lock = logging.threading.RLock()
 # setup notice level logging
 NOTICE = 25
-logging._levelNames[NOTICE] = 'NOTICE'
+logging.addLevelName(NOTICE, 'NOTICE')
 SysLogHandler.priority_map['NOTICE'] = 'notice'
 
 # These are lazily pulled from libc elsewhere
-_sys_fsync = None
 _sys_fallocate = None
 _posix_fadvise = None
+_libc_socket = None
+_libc_bind = None
+_libc_accept = None
+# see man -s 2 setpriority
+_libc_setpriority = None
+# see man -s 2 syscall
+_posix_syscall = None
+
+# If set to non-zero, fallocate routines will fail based on free space
+# available being at or below this amount, in bytes.
+FALLOCATE_RESERVE = 0
+# Indicates if FALLOCATE_RESERVE is the percentage of free space (True) or
+# the number of bytes (False).
+FALLOCATE_IS_PERCENT = False
+
+# from /usr/src/linux-headers-*/include/uapi/linux/resource.h
+PRIO_PROCESS = 0
+
+
+# /usr/include/x86_64-linux-gnu/asm/unistd_64.h defines syscalls there
+# are many like it, but this one is mine, see man -s 2 ioprio_set
+def NR_ioprio_set():
+    """Give __NR_ioprio_set value for your system."""
+    architecture = os.uname()[4]
+    arch_bits = platform.architecture()[0]
+    # check if supported system, now support only x86_64
+    if architecture == 'x86_64' and arch_bits == '64bit':
+        return 251
+    raise OSError("Swift doesn't support ionice priority for %s %s" %
+                  (architecture, arch_bits))
+
+# this syscall integer probably only works on x86_64 linux systems, you
+# can check if it's correct on yours with something like this:
+"""
+#include <stdio.h>
+#include <sys/syscall.h>
+
+int main(int argc, const char* argv[]) {
+    printf("%d\n", __NR_ioprio_set);
+    return 0;
+}
+"""
+
+# this is the value for "which" that says our who value will be a pid
+# pulled out of /usr/src/linux-headers-*/include/linux/ioprio.h
+IOPRIO_WHO_PROCESS = 1
+
+
+IO_CLASS_ENUM = {
+    'IOPRIO_CLASS_RT': 1,
+    'IOPRIO_CLASS_BE': 2,
+    'IOPRIO_CLASS_IDLE': 3,
+}
+
+# the IOPRIO_PRIO_VALUE "macro" is also pulled from
+# /usr/src/linux-headers-*/include/linux/ioprio.h
+IOPRIO_CLASS_SHIFT = 13
+
+
+def IOPRIO_PRIO_VALUE(class_, data):
+    return (((class_) << IOPRIO_CLASS_SHIFT) | data)
 
 # Used by hash_path to offer a bit more security when generating hashes for
 # paths. It simply appends this value to all paths; guessing the hash a path
 # will end up with would also require knowing this suffix.
-hash_conf = ConfigParser()
 HASH_PATH_SUFFIX = ''
-if hash_conf.read('/etc/swift/swift.conf'):
-    try:
-        HASH_PATH_SUFFIX = hash_conf.get('swift-hash',
-                                         'swift_hash_path_suffix')
-    except (NoSectionError, NoOptionError):
-        pass
+HASH_PATH_PREFIX = ''
+
+SWIFT_CONF_FILE = '/etc/swift/swift.conf'
+
+# These constants are Linux-specific, and Python doesn't seem to know
+# about them. We ask anyway just in case that ever gets fixed.
+#
+# The values were copied from the Linux 3.x kernel headers.
+AF_ALG = getattr(socket, 'AF_ALG', 38)
+F_SETPIPE_SZ = getattr(fcntl, 'F_SETPIPE_SZ', 1031)
+O_TMPFILE = getattr(os, 'O_TMPFILE', 0o20000000 | os.O_DIRECTORY)
+
+# Used by the parse_socket_string() function to validate IPv6 addresses
+IPV6_RE = re.compile("^\[(?P<address>.*)\](:(?P<port>[0-9]+))?$")
+
+MD5_OF_EMPTY_STRING = 'd41d8cd98f00b204e9800998ecf8427e'
+
+
+class InvalidHashPathConfigError(ValueError):
+
+    def __str__(self):
+        return "[swift-hash]: both swift_hash_path_suffix and " \
+            "swift_hash_path_prefix are missing from %s" % SWIFT_CONF_FILE
+
+
+def validate_hash_conf():
+    global HASH_PATH_SUFFIX
+    global HASH_PATH_PREFIX
+    if not HASH_PATH_SUFFIX and not HASH_PATH_PREFIX:
+        hash_conf = ConfigParser()
+        if hash_conf.read(SWIFT_CONF_FILE):
+            try:
+                HASH_PATH_SUFFIX = hash_conf.get('swift-hash',
+                                                 'swift_hash_path_suffix')
+            except (NoSectionError, NoOptionError):
+                pass
+            try:
+                HASH_PATH_PREFIX = hash_conf.get('swift-hash',
+                                                 'swift_hash_path_prefix')
+            except (NoSectionError, NoOptionError):
+                pass
+        if not HASH_PATH_SUFFIX and not HASH_PATH_PREFIX:
+            raise InvalidHashPathConfigError()
+
+
+try:
+    validate_hash_conf()
+except InvalidHashPathConfigError:
+    # could get monkey patched or lazy loaded
+    pass
+
+
+def get_hmac(request_method, path, expires, key):
+    """
+    Returns the hexdigest string of the HMAC-SHA1 (RFC 2104) for
+    the request.
+
+    :param request_method: Request method to allow.
+    :param path: The path to the resource to allow access to.
+    :param expires: Unix timestamp as an int for when the URL
+                    expires.
+    :param key: HMAC shared secret.
+
+    :returns: hexdigest str of the HMAC-SHA1 for the request.
+    """
+    return hmac.new(
+        key, '%s\n%s\n%s' % (request_method, expires, path), sha1).hexdigest()
+
+
+# Used by get_swift_info and register_swift_info to store information about
+# the swift cluster.
+_swift_info = {}
+_swift_admin_info = {}
+
+
+def get_swift_info(admin=False, disallowed_sections=None):
+    """
+    Returns information about the swift cluster that has been previously
+    registered with the register_swift_info call.
+
+    :param admin: boolean value, if True will additionally return an 'admin'
+                  section with information previously registered as admin
+                  info.
+    :param disallowed_sections: list of section names to be withheld from the
+                                information returned.
+    :returns: dictionary of information about the swift cluster.
+    """
+    disallowed_sections = disallowed_sections or []
+    info = dict(_swift_info)
+    for section in disallowed_sections:
+        key_to_pop = None
+        sub_section_dict = info
+        for sub_section in section.split('.'):
+            if key_to_pop:
+                sub_section_dict = sub_section_dict.get(key_to_pop, {})
+                if not isinstance(sub_section_dict, dict):
+                    sub_section_dict = {}
+                    break
+            key_to_pop = sub_section
+        sub_section_dict.pop(key_to_pop, None)
+
+    if admin:
+        info['admin'] = dict(_swift_admin_info)
+        info['admin']['disallowed_sections'] = list(disallowed_sections)
+    return info
+
+
+def register_swift_info(name='swift', admin=False, **kwargs):
+    """
+    Registers information about the swift cluster to be retrieved with calls
+    to get_swift_info.
+
+    NOTE: Do not use "." in the param: name or any keys in kwargs. "." is used
+          in the disallowed_sections to remove unwanted keys from /info.
+
+    :param name: string, the section name to place the information under.
+    :param admin: boolean, if True, information will be registered to an
+                  admin section which can optionally be withheld when
+                  requesting the information.
+    :param kwargs: key value arguments representing the information to be
+                   added.
+    :raises ValueError: if name or any of the keys in kwargs has "." in it
+    """
+    if name == 'admin' or name == 'disallowed_sections':
+        raise ValueError('\'{0}\' is reserved name.'.format(name))
+
+    if admin:
+        dict_to_use = _swift_admin_info
+    else:
+        dict_to_use = _swift_info
+    if name not in dict_to_use:
+        if "." in name:
+            raise ValueError('Cannot use "." in a swift_info key: %s' % name)
+        dict_to_use[name] = {}
+    for key, val in kwargs.items():
+        if "." in key:
+            raise ValueError('Cannot use "." in a swift_info key: %s' % key)
+        dict_to_use[name][key] = val
+
+
+def backward(f, blocksize=4096):
+    """
+    A generator returning lines from a file starting with the last line,
+    then the second last line, etc. i.e., it reads lines backwards.
+    Stops when the first line (if any) is read.
+    This is useful when searching for recent activity in very
+    large files.
+
+    :param f: file object to read
+    :param blocksize: no of characters to go backwards at each block
+    """
+    f.seek(0, os.SEEK_END)
+    if f.tell() == 0:
+        return
+    last_row = b''
+    while f.tell() != 0:
+        try:
+            f.seek(-blocksize, os.SEEK_CUR)
+        except IOError:
+            blocksize = f.tell()
+            f.seek(-blocksize, os.SEEK_CUR)
+        block = f.read(blocksize)
+        f.seek(-blocksize, os.SEEK_CUR)
+        rows = block.split(b'\n')
+        rows[-1] = rows[-1] + last_row
+        while rows:
+            last_row = rows.pop(-1)
+            if rows and last_row:
+                yield last_row
+    yield last_row
+
 
 # Used when reading config values
 TRUE_VALUES = set(('true', '1', 'yes', 'on', 't', 'y'))
@@ -92,7 +340,89 @@ def config_true_value(value):
     Returns False otherwise.
     """
     return value is True or \
-        (isinstance(value, basestring) and value.lower() in TRUE_VALUES)
+        (isinstance(value, six.string_types) and value.lower() in TRUE_VALUES)
+
+
+def config_auto_int_value(value, default):
+    """
+    Returns default if value is None or 'auto'.
+    Returns value as an int or raises ValueError otherwise.
+    """
+    if value is None or \
+       (isinstance(value, six.string_types) and value.lower() == 'auto'):
+        return default
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        raise ValueError('Config option must be an integer or the '
+                         'string "auto", not "%s".' % value)
+    return value
+
+
+def append_underscore(prefix):
+    if prefix and not prefix.endswith('_'):
+        prefix += '_'
+    return prefix
+
+
+def config_read_reseller_options(conf, defaults):
+    """
+    Read reseller_prefix option and associated options from configuration
+
+    Reads the reseller_prefix option, then reads options that may be
+    associated with a specific reseller prefix. Reads options such that an
+    option without a prefix applies to all reseller prefixes unless an option
+    has an explicit prefix.
+
+    :param conf: the configuration
+    :param defaults: a dict of default values. The key is the option
+                     name. The value is either an array of strings or a string
+    :return: tuple of an array of reseller prefixes and a dict of option values
+    """
+    reseller_prefix_opt = conf.get('reseller_prefix', 'AUTH').split(',')
+    reseller_prefixes = []
+    for prefix in [pre.strip() for pre in reseller_prefix_opt if pre.strip()]:
+        if prefix == "''":
+            prefix = ''
+        prefix = append_underscore(prefix)
+        if prefix not in reseller_prefixes:
+            reseller_prefixes.append(prefix)
+    if len(reseller_prefixes) == 0:
+        reseller_prefixes.append('')
+
+    # Get prefix-using config options
+    associated_options = {}
+    for prefix in reseller_prefixes:
+        associated_options[prefix] = dict(defaults)
+        associated_options[prefix].update(
+            config_read_prefixed_options(conf, '', defaults))
+        prefix_name = prefix if prefix != '' else "''"
+        associated_options[prefix].update(
+            config_read_prefixed_options(conf, prefix_name, defaults))
+    return reseller_prefixes, associated_options
+
+
+def config_read_prefixed_options(conf, prefix_name, defaults):
+    """
+    Read prefixed options from configuration
+
+    :param conf: the configuration
+    :param prefix_name: the prefix (including, if needed, an underscore)
+    :param defaults: a dict of default values. The dict supplies the
+                     option name and type (string or comma separated string)
+    :return: a dict containing the options
+    """
+    params = {}
+    for option_name in defaults.keys():
+        value = conf.get('%s%s' % (prefix_name, option_name))
+        if value:
+            if isinstance(defaults.get(option_name), list):
+                params[option_name] = []
+                for role in value.lower().split(','):
+                    params[option_name].append(role.strip())
+            else:
+                params[option_name] = value.strip()
+    return params
 
 
 def noop_libc_function(*args):
@@ -100,66 +430,274 @@ def noop_libc_function(*args):
 
 
 def validate_configuration():
-    if HASH_PATH_SUFFIX == '':
-        sys.exit("Error: [swift-hash]: swift_hash_path_suffix missing "
-                 "from /etc/swift/swift.conf")
+    try:
+        validate_hash_conf()
+    except InvalidHashPathConfigError as e:
+        sys.exit("Error: %s" % e)
 
 
-def load_libc_function(func_name, log_error=True):
+def load_libc_function(func_name, log_error=True,
+                       fail_if_missing=False, errcheck=False):
     """
     Attempt to find the function in libc, otherwise return a no-op func.
 
     :param func_name: name of the function to pull from libc.
+    :param log_error: log an error when a function can't be found
+    :param fail_if_missing: raise an exception when a function can't be found.
+                            Default behavior is to return a no-op function.
+    :param errcheck: boolean, if true install a wrapper on the function
+                     to check for a return values of -1 and call
+                     ctype.get_errno and raise an OSError
     """
     try:
         libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
-        return getattr(libc, func_name)
+        func = getattr(libc, func_name)
     except AttributeError:
+        if fail_if_missing:
+            raise
         if log_error:
-            logging.warn(_("Unable to locate %s in libc.  Leaving as a "
-                         "no-op."), func_name)
+            logging.warning(_("Unable to locate %s in libc.  Leaving as a "
+                            "no-op."), func_name)
         return noop_libc_function
+    if errcheck:
+        def _errcheck(result, f, args):
+            if result == -1:
+                errcode = ctypes.get_errno()
+                raise OSError(errcode, os.strerror(errcode))
+            return result
+        func.errcheck = _errcheck
+    return func
 
 
-def get_param(req, name, default=None):
+def generate_trans_id(trans_id_suffix):
+    return 'tx%s-%010x%s' % (
+        uuid.uuid4().hex[:21], time.time(), quote(trans_id_suffix))
+
+
+def get_policy_index(req_headers, res_headers):
     """
-    Get parameters from an HTTP request ensuring proper handling UTF-8
-    encoding.
+    Returns the appropriate index of the storage policy for the request from
+    a proxy server
 
-    :param req: request object
-    :param name: parameter name
-    :param default: result to return if the parameter is not found
-    :returns: HTTP request parameter value
+    :param req: dict of the request headers.
+    :param res: dict of the response headers.
+
+    :returns: string index of storage policy, or None
     """
-    value = req.params.get(name, default)
-    if value and not isinstance(value, unicode):
-        value.decode('utf8')    # Ensure UTF8ness
-    return value
+    header = 'X-Backend-Storage-Policy-Index'
+    policy_index = res_headers.get(header, req_headers.get(header))
+    return str(policy_index) if policy_index is not None else None
+
+
+def get_log_line(req, res, trans_time, additional_info):
+    """
+    Make a line for logging that matches the documented log line format
+    for backend servers.
+
+    :param req: the request.
+    :param res: the response.
+    :param trans_time: the time the request took to complete, a float.
+    :param additional_info: a string to log at the end of the line
+
+    :returns: a properly formatted line for logging.
+    """
+
+    policy_index = get_policy_index(req.headers, res.headers)
+    return '%s - - [%s] "%s %s" %s %s "%s" "%s" "%s" %.4f "%s" %d %s' % (
+        req.remote_addr,
+        time.strftime('%d/%b/%Y:%H:%M:%S +0000', time.gmtime()),
+        req.method, req.path, res.status.split()[0],
+        res.content_length or '-', req.referer or '-',
+        req.headers.get('x-trans-id', '-'),
+        req.user_agent or '-', trans_time, additional_info or '-',
+        os.getpid(), policy_index or '-')
+
+
+def get_trans_id_time(trans_id):
+    if len(trans_id) >= 34 and \
+       trans_id.startswith('tx') and trans_id[23] == '-':
+        try:
+            return int(trans_id[24:34], 16)
+        except ValueError:
+            pass
+    return None
+
+
+def config_fallocate_value(reserve_value):
+    """
+    Returns fallocate reserve_value as an int or float.
+    Returns is_percent as a boolean.
+    Returns a ValueError on invalid fallocate value.
+    """
+    try:
+        if str(reserve_value[-1:]) == '%':
+            reserve_value = float(reserve_value[:-1])
+            is_percent = True
+        else:
+            reserve_value = int(reserve_value)
+            is_percent = False
+    except ValueError:
+        raise ValueError('Error: %s is an invalid value for fallocate'
+                         '_reserve.' % reserve_value)
+    return reserve_value, is_percent
+
+
+class FileLikeIter(object):
+
+    def __init__(self, iterable):
+        """
+        Wraps an iterable to behave as a file-like object.
+
+        The iterable must yield bytes strings.
+        """
+        self.iterator = iter(iterable)
+        self.buf = None
+        self.closed = False
+
+    def __iter__(self):
+        return self
+
+    def next(self):
+        """
+        next(x) -> the next value, or raise StopIteration
+        """
+        if self.closed:
+            raise ValueError('I/O operation on closed file')
+        if self.buf:
+            rv = self.buf
+            self.buf = None
+            return rv
+        else:
+            return next(self.iterator)
+    __next__ = next
+
+    def read(self, size=-1):
+        """
+        read([size]) -> read at most size bytes, returned as a bytes string.
+
+        If the size argument is negative or omitted, read until EOF is reached.
+        Notice that when in non-blocking mode, less data than what was
+        requested may be returned, even if no size parameter was given.
+        """
+        if self.closed:
+            raise ValueError('I/O operation on closed file')
+        if size < 0:
+            return b''.join(self)
+        elif not size:
+            chunk = b''
+        elif self.buf:
+            chunk = self.buf
+            self.buf = None
+        else:
+            try:
+                chunk = next(self.iterator)
+            except StopIteration:
+                return b''
+        if len(chunk) > size:
+            self.buf = chunk[size:]
+            chunk = chunk[:size]
+        return chunk
+
+    def readline(self, size=-1):
+        """
+        readline([size]) -> next line from the file, as a bytes string.
+
+        Retain newline.  A non-negative size argument limits the maximum
+        number of bytes to return (an incomplete line may be returned then).
+        Return an empty string at EOF.
+        """
+        if self.closed:
+            raise ValueError('I/O operation on closed file')
+        data = b''
+        while b'\n' not in data and (size < 0 or len(data) < size):
+            if size < 0:
+                chunk = self.read(1024)
+            else:
+                chunk = self.read(size - len(data))
+            if not chunk:
+                break
+            data += chunk
+        if b'\n' in data:
+            data, sep, rest = data.partition(b'\n')
+            data += sep
+            if self.buf:
+                self.buf = rest + self.buf
+            else:
+                self.buf = rest
+        return data
+
+    def readlines(self, sizehint=-1):
+        """
+        readlines([size]) -> list of bytes strings, each a line from the file.
+
+        Call readline() repeatedly and return a list of the lines so read.
+        The optional size argument, if given, is an approximate bound on the
+        total number of bytes in the lines returned.
+        """
+        if self.closed:
+            raise ValueError('I/O operation on closed file')
+        lines = []
+        while True:
+            line = self.readline(sizehint)
+            if not line:
+                break
+            lines.append(line)
+            if sizehint >= 0:
+                sizehint -= len(line)
+                if sizehint <= 0:
+                    break
+        return lines
+
+    def close(self):
+        """
+        close() -> None or (perhaps) an integer.  Close the file.
+
+        Sets data attribute .closed to True.  A closed file cannot be used for
+        further I/O operations.  close() may be called more than once without
+        error.  Some kinds of file objects (for example, opened by popen())
+        may return an exit status upon closing.
+        """
+        self.iterator = None
+        self.closed = True
 
 
 class FallocateWrapper(object):
 
     def __init__(self, noop=False):
-        if noop:
+        self.noop = noop
+        if self.noop:
             self.func_name = 'posix_fallocate'
             self.fallocate = noop_libc_function
             return
-        ## fallocate is prefered because we need the on-disk size to match
-        ## the allocated size. Older versions of sqlite require that the
-        ## two sizes match. However, fallocate is Linux only.
+        # fallocate is preferred because we need the on-disk size to match
+        # the allocated size. Older versions of sqlite require that the
+        # two sizes match. However, fallocate is Linux only.
         for func in ('fallocate', 'posix_fallocate'):
             self.func_name = func
             self.fallocate = load_libc_function(func, log_error=False)
             if self.fallocate is not noop_libc_function:
                 break
         if self.fallocate is noop_libc_function:
-            logging.warn(_("Unable to locate fallocate, posix_fallocate in "
-                         "libc.  Leaving as a no-op."))
+            logging.warning(_("Unable to locate fallocate, posix_fallocate in "
+                            "libc.  Leaving as a no-op."))
 
-    def __call__(self, fd, mode, offset, len):
+    def __call__(self, fd, mode, offset, length):
+        """The length parameter must be a ctypes.c_uint64."""
+        if not self.noop:
+            if FALLOCATE_RESERVE > 0:
+                st = os.fstatvfs(fd)
+                free = st.f_frsize * st.f_bavail - length.value
+                if FALLOCATE_IS_PERCENT:
+                    free = \
+                        (float(free) / float(st.f_frsize * st.f_blocks)) * 100
+                if float(free) <= float(FALLOCATE_RESERVE):
+                    raise OSError(
+                        errno.ENOSPC,
+                        'FALLOCATE_RESERVE fail %s <= %s' %
+                        (free, FALLOCATE_RESERVE))
         args = {
-            'fallocate': (fd, mode, offset, len),
-            'posix_fallocate': (fd, offset, len)
+            'fallocate': (fd, mode, offset, length),
+            'posix_fallocate': (fd, offset, length)
         }
         return self.fallocate(*args[self.func_name])
 
@@ -179,55 +717,63 @@ def fallocate(fd, size):
     global _sys_fallocate
     if _sys_fallocate is None:
         _sys_fallocate = FallocateWrapper()
-    if size > 0:
-        # 1 means "FALLOC_FL_KEEP_SIZE", which means it pre-allocates invisibly
-        ret = _sys_fallocate(fd, 1, 0, ctypes.c_uint64(size))
-        err = ctypes.get_errno()
-        if ret and err not in (0, errno.ENOSYS, errno.EOPNOTSUPP,
-                               errno.EINVAL):
-            raise OSError(err, 'Unable to fallocate(%s)' % size)
-
-
-class FsyncWrapper(object):
-
-    def __init__(self):
-        if hasattr(os, 'fdatasync'):
-            self.func_name = 'fdatasync'
-            self.fsync = os.fdatasync
-            self.fcntl_flag = None
-        elif hasattr(fcntl, 'F_FULLFSYNC'):
-            self.func_name = 'fcntl'
-            self.fsync = fcntl.fcntl
-            self.fcntl_flag = fcntl.F_FULLFSYNC
-        else:
-            self.func_name = 'fsync'
-            self.fsync = os.fsync
-            self.fcntl_flag = None
-
-    def __call__(self, fd):
-        args = {
-            'fdatasync': (fd, ),
-            'fsync': (fd, ),
-            'fcntl': (fd, self.fcntl_flag)
-        }
-        return self.fsync(*args[self.func_name])
+    if size < 0:
+        size = 0
+    # 1 means "FALLOC_FL_KEEP_SIZE", which means it pre-allocates invisibly
+    ret = _sys_fallocate(fd, 1, 0, ctypes.c_uint64(size))
+    err = ctypes.get_errno()
+    if ret and err not in (0, errno.ENOSYS, errno.EOPNOTSUPP,
+                           errno.EINVAL):
+        raise OSError(err, 'Unable to fallocate(%s)' % size)
 
 
 def fsync(fd):
     """
-    Write buffered changes to disk.
+    Sync modified file data and metadata to disk.
 
     :param fd: file descriptor
     """
+    if hasattr(fcntl, 'F_FULLSYNC'):
+        try:
+            fcntl.fcntl(fd, fcntl.F_FULLSYNC)
+        except IOError as e:
+            raise OSError(e.errno, 'Unable to F_FULLSYNC(%s)' % fd)
+    else:
+        os.fsync(fd)
 
-    global _sys_fsync
-    if _sys_fsync is None:
-        _sys_fsync = FsyncWrapper()
 
-    ret = _sys_fsync(fd)
-    err = ctypes.get_errno()
-    if ret and err != 0:
-        raise OSError(err, 'Unable to fsync(%s)' % fd)
+def fdatasync(fd):
+    """
+    Sync modified file data to disk.
+
+    :param fd: file descriptor
+    """
+    try:
+        os.fdatasync(fd)
+    except AttributeError:
+        fsync(fd)
+
+
+def fsync_dir(dirpath):
+    """
+    Sync directory entries to disk.
+
+    :param dirpath: Path to the directory to be synced.
+    """
+    dirfd = None
+    try:
+        dirfd = os.open(dirpath, os.O_DIRECTORY | os.O_RDONLY)
+        fsync(dirfd)
+    except OSError as err:
+        if err.errno == errno.ENOTDIR:
+            # Raise error if someone calls fsync_dir on a non-directory
+            raise
+        logging.warning(_('Unable to perform fsync() on directory %(dir)s:'
+                          ' %(err)s'),
+                        {'dir': dirpath, 'err': os.strerror(err.errno)})
+    finally:
+        if dirfd:
+            os.close(dirfd)
 
 
 def drop_buffer_cache(fd, offset, length):
@@ -245,19 +791,335 @@ def drop_buffer_cache(fd, offset, length):
     ret = _posix_fadvise(fd, ctypes.c_uint64(offset),
                          ctypes.c_uint64(length), 4)
     if ret != 0:
-        logging.warn("posix_fadvise64(%s, %s, %s, 4) -> %s"
-                     % (fd, offset, length, ret))
+        logging.warning("posix_fadvise64(%(fd)s, %(offset)s, %(length)s, 4) "
+                        "-> %(ret)s", {'fd': fd, 'offset': offset,
+                                       'length': length, 'ret': ret})
+
+
+NORMAL_FORMAT = "%016.05f"
+INTERNAL_FORMAT = NORMAL_FORMAT + '_%016x'
+SHORT_FORMAT = NORMAL_FORMAT + '_%x'
+MAX_OFFSET = (16 ** 16) - 1
+PRECISION = 1e-5
+# Setting this to True will cause the internal format to always display
+# extended digits - even when the value is equivalent to the normalized form.
+# This isn't ideal during an upgrade when some servers might not understand
+# the new time format - but flipping it to True works great for testing.
+FORCE_INTERNAL = False  # or True
+
+
+@functools.total_ordering
+class Timestamp(object):
+    """
+    Internal Representation of Swift Time.
+
+    The normalized form of the X-Timestamp header looks like a float
+    with a fixed width to ensure stable string sorting - normalized
+    timestamps look like "1402464677.04188"
+
+    To support overwrites of existing data without modifying the original
+    timestamp but still maintain consistency a second internal offset vector
+    is append to the normalized timestamp form which compares and sorts
+    greater than the fixed width float format but less than a newer timestamp.
+    The internalized format of timestamps looks like
+    "1402464677.04188_0000000000000000" - the portion after the underscore is
+    the offset and is a formatted hexadecimal integer.
+
+    The internalized form is not exposed to clients in responses from
+    Swift.  Normal client operations will not create a timestamp with an
+    offset.
+
+    The Timestamp class in common.utils supports internalized and
+    normalized formatting of timestamps and also comparison of timestamp
+    values.  When the offset value of a Timestamp is 0 - it's considered
+    insignificant and need not be represented in the string format; to
+    support backwards compatibility during a Swift upgrade the
+    internalized and normalized form of a Timestamp with an
+    insignificant offset are identical.  When a timestamp includes an
+    offset it will always be represented in the internalized form, but
+    is still excluded from the normalized form.  Timestamps with an
+    equivalent timestamp portion (the float part) will compare and order
+    by their offset.  Timestamps with a greater timestamp portion will
+    always compare and order greater than a Timestamp with a lesser
+    timestamp regardless of it's offset.  String comparison and ordering
+    is guaranteed for the internalized string format, and is backwards
+    compatible for normalized timestamps which do not include an offset.
+    """
+
+    def __init__(self, timestamp, offset=0, delta=0):
+        """
+        Create a new Timestamp.
+
+        :param timestamp: time in seconds since the Epoch, may be any of:
+
+            * a float or integer
+            * normalized/internalized string
+            * another instance of this class (offset is preserved)
+
+        :param offset: the second internal offset vector, an int
+        :param delta: deca-microsecond difference from the base timestamp
+                      param, an int
+        """
+        if isinstance(timestamp, six.string_types):
+            parts = timestamp.split('_', 1)
+            self.timestamp = float(parts.pop(0))
+            if parts:
+                self.offset = int(parts[0], 16)
+            else:
+                self.offset = 0
+        else:
+            self.timestamp = float(timestamp)
+            self.offset = getattr(timestamp, 'offset', 0)
+        # increment offset
+        if offset >= 0:
+            self.offset += offset
+        else:
+            raise ValueError('offset must be non-negative')
+        if self.offset > MAX_OFFSET:
+            raise ValueError('offset must be smaller than %d' % MAX_OFFSET)
+        self.raw = int(round(self.timestamp / PRECISION))
+        # add delta
+        if delta:
+            self.raw = self.raw + delta
+            if self.raw <= 0:
+                raise ValueError(
+                    'delta must be greater than %d' % (-1 * self.raw))
+            self.timestamp = float(self.raw * PRECISION)
+        if self.timestamp < 0:
+            raise ValueError('timestamp cannot be negative')
+        if self.timestamp >= 10000000000:
+            raise ValueError('timestamp too large')
+
+    def __repr__(self):
+        return INTERNAL_FORMAT % (self.timestamp, self.offset)
+
+    def __str__(self):
+        raise TypeError('You must specify which string format is required')
+
+    def __float__(self):
+        return self.timestamp
+
+    def __int__(self):
+        return int(self.timestamp)
+
+    def __nonzero__(self):
+        return bool(self.timestamp or self.offset)
+
+    def __bool__(self):
+        return self.__nonzero__()
+
+    @property
+    def normal(self):
+        return NORMAL_FORMAT % self.timestamp
+
+    @property
+    def internal(self):
+        if self.offset or FORCE_INTERNAL:
+            return INTERNAL_FORMAT % (self.timestamp, self.offset)
+        else:
+            return self.normal
+
+    @property
+    def short(self):
+        if self.offset or FORCE_INTERNAL:
+            return SHORT_FORMAT % (self.timestamp, self.offset)
+        else:
+            return self.normal
+
+    @property
+    def isoformat(self):
+        t = float(self.normal)
+        if six.PY3:
+            # On Python 3, round manually using ROUND_HALF_EVEN rounding
+            # method, to use the same rounding method than Python 2. Python 3
+            # used a different rounding method, but Python 3.4.4 and 3.5.1 use
+            # again ROUND_HALF_EVEN as Python 2.
+            # See https://bugs.python.org/issue23517
+            frac, t = math.modf(t)
+            us = round(frac * 1e6)
+            if us >= 1000000:
+                t += 1
+                us -= 1000000
+            elif us < 0:
+                t -= 1
+                us += 1000000
+            dt = datetime.datetime.utcfromtimestamp(t)
+            dt = dt.replace(microsecond=us)
+        else:
+            dt = datetime.datetime.utcfromtimestamp(t)
+
+        isoformat = dt.isoformat()
+        # python isoformat() doesn't include msecs when zero
+        if len(isoformat) < len("1970-01-01T00:00:00.000000"):
+            isoformat += ".000000"
+        return isoformat
+
+    def __eq__(self, other):
+        if other is None:
+            return False
+        if not isinstance(other, Timestamp):
+            other = Timestamp(other)
+        return self.internal == other.internal
+
+    def __ne__(self, other):
+        if other is None:
+            return True
+        if not isinstance(other, Timestamp):
+            other = Timestamp(other)
+        return self.internal != other.internal
+
+    def __lt__(self, other):
+        if other is None:
+            return False
+        if not isinstance(other, Timestamp):
+            other = Timestamp(other)
+        return self.internal < other.internal
+
+    def __hash__(self):
+        return hash(self.internal)
+
+
+def encode_timestamps(t1, t2=None, t3=None, explicit=False):
+    """
+    Encode up to three timestamps into a string. Unlike a Timestamp object, the
+    encoded string does NOT used fixed width fields and consequently no
+    relative chronology of the timestamps can be inferred from lexicographic
+    sorting of encoded timestamp strings.
+
+    The format of the encoded string is:
+        <t1>[<+/-><t2 - t1>[<+/-><t3 - t2>]]
+
+    i.e. if t1 = t2 = t3 then just the string representation of t1 is returned,
+    otherwise the time offsets for t2 and t3 are appended. If explicit is True
+    then the offsets for t2 and t3 are always appended even if zero.
+
+    Note: any offset value in t1 will be preserved, but offsets on t2 and t3
+    are not preserved. In the anticipated use cases for this method (and the
+    inverse decode_timestamps method) the timestamps passed as t2 and t3 are
+    not expected to have offsets as they will be timestamps associated with a
+    POST request. In the case where the encoding is used in a container objects
+    table row, t1 could be the PUT or DELETE time but t2 and t3 represent the
+    content type and metadata times (if different from the data file) i.e.
+    correspond to POST timestamps. In the case where the encoded form is used
+    in a .meta file name, t1 and t2 both correspond to POST timestamps.
+    """
+    form = '{0}'
+    values = [t1.short]
+    if t2 is not None:
+        t2_t1_delta = t2.raw - t1.raw
+        explicit = explicit or (t2_t1_delta != 0)
+        values.append(t2_t1_delta)
+        if t3 is not None:
+            t3_t2_delta = t3.raw - t2.raw
+            explicit = explicit or (t3_t2_delta != 0)
+            values.append(t3_t2_delta)
+        if explicit:
+            form += '{1:+x}'
+            if t3 is not None:
+                form += '{2:+x}'
+    return form.format(*values)
+
+
+def decode_timestamps(encoded, explicit=False):
+    """
+    Parses a string of the form generated by encode_timestamps and returns
+    a tuple of the three component timestamps. If explicit is False, component
+    timestamps that are not explicitly encoded will be assumed to have zero
+    delta from the previous component and therefore take the value of the
+    previous component. If explicit is True, component timestamps that are
+    not explicitly encoded will be returned with value None.
+    """
+    # TODO: some tests, e.g. in test_replicator, put float timestamps values
+    # into container db's, hence this defensive check, but in real world
+    # this may never happen.
+    if not isinstance(encoded, six.string_types):
+        ts = Timestamp(encoded)
+        return ts, ts, ts
+
+    parts = []
+    signs = []
+    pos_parts = encoded.split('+')
+    for part in pos_parts:
+        # parse time components and their signs
+        # e.g. x-y+z --> parts = [x, y, z] and signs = [+1, -1, +1]
+        neg_parts = part.split('-')
+        parts = parts + neg_parts
+        signs = signs + [1] + [-1] * (len(neg_parts) - 1)
+    t1 = Timestamp(parts[0])
+    t2 = t3 = None
+    if len(parts) > 1:
+        t2 = t1
+        delta = signs[1] * int(parts[1], 16)
+        # if delta = 0 we want t2 = t3 = t1 in order to
+        # preserve any offset in t1 - only construct a distinct
+        # timestamp if there is a non-zero delta.
+        if delta:
+            t2 = Timestamp((t1.raw + delta) * PRECISION)
+    elif not explicit:
+        t2 = t1
+    if len(parts) > 2:
+        t3 = t2
+        delta = signs[2] * int(parts[2], 16)
+        if delta:
+            t3 = Timestamp((t2.raw + delta) * PRECISION)
+    elif not explicit:
+        t3 = t2
+    return t1, t2, t3
 
 
 def normalize_timestamp(timestamp):
     """
     Format a timestamp (string or numeric) into a standardized
-    xxxxxxxxxx.xxxxx format.
+    xxxxxxxxxx.xxxxx (10.5) format.
+
+    Note that timestamps using values greater than or equal to November 20th,
+    2286 at 17:46 UTC will use 11 digits to represent the number of
+    seconds.
 
     :param timestamp: unix timestamp
     :returns: normalized timestamp as a string
     """
-    return "%016.05f" % (float(timestamp))
+    return Timestamp(timestamp).normal
+
+
+EPOCH = datetime.datetime(1970, 1, 1)
+
+
+def last_modified_date_to_timestamp(last_modified_date_str):
+    """
+    Convert a last modified date (like you'd get from a container listing,
+    e.g. 2014-02-28T23:22:36.698390) to a float.
+    """
+    start = datetime.datetime.strptime(last_modified_date_str,
+                                       '%Y-%m-%dT%H:%M:%S.%f')
+    delta = start - EPOCH
+
+    # This calculation is based on Python 2.7's Modules/datetimemodule.c,
+    # function delta_to_microseconds(), but written in Python.
+    return Timestamp(delta.total_seconds())
+
+
+def normalize_delete_at_timestamp(timestamp):
+    """
+    Format a timestamp (string or numeric) into a standardized
+    xxxxxxxxxx (10) format.
+
+    Note that timestamps less than 0000000000 are raised to
+    0000000000 and values greater than November 20th, 2286 at
+    17:46:39 UTC will be capped at that date and time, resulting in
+    no return value exceeding 9999999999.
+
+    This cap is because the expirer is already working through a
+    sorted list of strings that were all a length of 10. Adding
+    another digit would mess up the sort and cause the expirer to
+    break from processing early. By 2286, this problem will need to
+    be fixed, probably by creating an additional .expiring_objects
+    account to work from with 11 (or more) digit container names.
+
+    :param timestamp: unix timestamp
+    :returns: normalized timestamp as a string
+    """
+    return '%010d' % min(max(0, float(timestamp)), 9999999999)
 
 
 def mkdirs(path):
@@ -270,25 +1132,112 @@ def mkdirs(path):
     if not os.path.isdir(path):
         try:
             os.makedirs(path)
-        except OSError, err:
+        except OSError as err:
             if err.errno != errno.EEXIST or not os.path.isdir(path):
                 raise
 
 
-def renamer(old, new):
+def makedirs_count(path, count=0):
+    """
+    Same as os.makedirs() except that this method returns the number of
+    new directories that had to be created.
+
+    Also, this does not raise an error if target directory already exists.
+    This behaviour is similar to Python 3.x's os.makedirs() called with
+    exist_ok=True. Also similar to swift.common.utils.mkdirs()
+
+    https://hg.python.org/cpython/file/v3.4.2/Lib/os.py#l212
+    """
+    head, tail = os.path.split(path)
+    if not tail:
+        head, tail = os.path.split(head)
+    if head and tail and not os.path.exists(head):
+        count = makedirs_count(head, count)
+        if tail == os.path.curdir:
+            return
+    try:
+        os.mkdir(path)
+    except OSError as e:
+        # EEXIST may also be raised if path exists as a file
+        # Do not let that pass.
+        if e.errno != errno.EEXIST or not os.path.isdir(path):
+            raise
+    else:
+        count += 1
+    return count
+
+
+def renamer(old, new, fsync=True):
     """
     Attempt to fix / hide race conditions like empty object directories
     being removed by backend processes during uploads, by retrying.
 
+    The containing directory of 'new' and of all newly created directories are
+    fsync'd by default. This _will_ come at a performance penalty. In cases
+    where these additional fsyncs are not necessary, it is expected that the
+    caller of renamer() turn it off explicitly.
+
     :param old: old path to be renamed
     :param new: new path to be renamed to
+    :param fsync: fsync on containing directory of new and also all
+                  the newly created directories.
     """
+    dirpath = os.path.dirname(new)
     try:
-        mkdirs(os.path.dirname(new))
+        count = makedirs_count(dirpath)
         os.rename(old, new)
-    except OSError, err:
-        mkdirs(os.path.dirname(new))
+    except OSError:
+        count = makedirs_count(dirpath)
         os.rename(old, new)
+    if fsync:
+        # If count=0, no new directories were created. But we still need to
+        # fsync leaf dir after os.rename().
+        # If count>0, starting from leaf dir, fsync parent dirs of all
+        # directories created by makedirs_count()
+        for i in range(0, count + 1):
+            fsync_dir(dirpath)
+            dirpath = os.path.dirname(dirpath)
+
+
+def link_fd_to_path(fd, target_path, dirs_created=0, retries=2, fsync=True):
+    """
+    Creates a link to file descriptor at target_path specified. This method
+    does not close the fd for you. Unlike rename, as linkat() cannot
+    overwrite target_path if it exists, we unlink and try again.
+
+    Attempts to fix / hide race conditions like empty object directories
+    being removed by backend processes during uploads, by retrying.
+
+    :param fd: File descriptor to be linked
+    :param target_path: Path in filesystem where fd is to be linked
+    :param dirs_created: Number of newly created directories that needs to
+                         be fsync'd.
+    :param retries: number of retries to make
+    :param fsync: fsync on containing directory of target_path and also all
+                  the newly created directories.
+    """
+    dirpath = os.path.dirname(target_path)
+    for _junk in range(0, retries):
+        try:
+            linkat(linkat.AT_FDCWD, "/proc/self/fd/%d" % (fd),
+                   linkat.AT_FDCWD, target_path, linkat.AT_SYMLINK_FOLLOW)
+            break
+        except IOError as err:
+            if err.errno == errno.ENOENT:
+                dirs_created = makedirs_count(dirpath)
+            elif err.errno == errno.EEXIST:
+                try:
+                    os.unlink(target_path)
+                except OSError as e:
+                    if e.errno != errno.ENOENT:
+                        raise
+            else:
+                raise
+
+    if fsync:
+        for i in range(0, dirs_created + 1):
+            fsync_dir(dirpath)
+            dirpath = os.path.dirname(dirpath)
 
 
 def split_path(path, minsegs=1, maxsegs=None, rest_with_last=False):
@@ -308,7 +1257,7 @@ def split_path(path, minsegs=1, maxsegs=None, rest_with_last=False):
     :param rest_with_last: If True, trailing data will be returned as part
                            of last segment.  If False, and there is
                            trailing data, raises ValueError.
-    :returns: list of segments with a length of maxsegs (non-existant
+    :returns: list of segments with a length of maxsegs (non-existent
               segments will return as None)
     :raises: ValueError if given an invalid path
     """
@@ -347,42 +1296,154 @@ def validate_device_partition(device, partition):
     :param partition: partition to validate
     :raises: ValueError if given an invalid device or partition
     """
-    invalid_device = False
-    invalid_partition = False
     if not device or '/' in device or device in ['.', '..']:
-        invalid_device = True
-    if not partition or '/' in partition or partition in ['.', '..']:
-        invalid_partition = True
-
-    if invalid_device:
         raise ValueError('Invalid device: %s' % quote(device or ''))
-    elif invalid_partition:
+    if not partition or '/' in partition or partition in ['.', '..']:
         raise ValueError('Invalid partition: %s' % quote(partition or ''))
 
 
-class NullLogger():
+class RateLimitedIterator(object):
+    """
+    Wrap an iterator to only yield elements at a rate of N per second.
+
+    :param iterable: iterable to wrap
+    :param elements_per_second: the rate at which to yield elements
+    :param limit_after: rate limiting kicks in only after yielding
+                        this many elements; default is 0 (rate limit
+                        immediately)
+    """
+    def __init__(self, iterable, elements_per_second, limit_after=0,
+                 ratelimit_if=lambda _junk: True):
+        self.iterator = iter(iterable)
+        self.elements_per_second = elements_per_second
+        self.limit_after = limit_after
+        self.running_time = 0
+        self.ratelimit_if = ratelimit_if
+
+    def __iter__(self):
+        return self
+
+    def next(self):
+        next_value = next(self.iterator)
+
+        if self.ratelimit_if(next_value):
+            if self.limit_after > 0:
+                self.limit_after -= 1
+            else:
+                self.running_time = ratelimit_sleep(self.running_time,
+                                                    self.elements_per_second)
+        return next_value
+    __next__ = next
+
+
+class GreenthreadSafeIterator(object):
+    """
+    Wrap an iterator to ensure that only one greenthread is inside its next()
+    method at a time.
+
+    This is useful if an iterator's next() method may perform network IO, as
+    that may trigger a greenthread context switch (aka trampoline), which can
+    give another greenthread a chance to call next(). At that point, you get
+    an error like "ValueError: generator already executing". By wrapping calls
+    to next() with a mutex, we avoid that error.
+    """
+    def __init__(self, unsafe_iterable):
+        self.unsafe_iter = iter(unsafe_iterable)
+        self.semaphore = eventlet.semaphore.Semaphore(value=1)
+
+    def __iter__(self):
+        return self
+
+    def next(self):
+        with self.semaphore:
+            return next(self.unsafe_iter)
+    __next__ = next
+
+
+class NullLogger(object):
     """A no-op logger for eventlet wsgi."""
 
     def write(self, *args):
-        #"Logs" the args to nowhere
+        # "Logs" the args to nowhere
+        pass
+
+    def exception(self, *args):
+        pass
+
+    def critical(self, *args):
+        pass
+
+    def error(self, *args):
+        pass
+
+    def warning(self, *args):
+        pass
+
+    def info(self, *args):
+        pass
+
+    def debug(self, *args):
+        pass
+
+    def log(self, *args):
         pass
 
 
 class LoggerFileObject(object):
 
-    def __init__(self, logger):
+    # Note: this is greenthread-local storage
+    _cls_thread_local = threading.local()
+
+    def __init__(self, logger, log_type='STDOUT'):
         self.logger = logger
+        self.log_type = log_type
 
     def write(self, value):
-        value = value.strip()
-        if value:
-            if 'Connection reset by peer' in value:
-                self.logger.error(_('STDOUT: Connection reset by peer'))
-            else:
-                self.logger.error(_('STDOUT: %s'), value)
+        # We can get into a nasty situation when logs are going to syslog
+        # and syslog dies.
+        #
+        # It's something like this:
+        #
+        # (A) someone logs something
+        #
+        # (B) there's an exception in sending to /dev/log since syslog is
+        #     not working
+        #
+        # (C) logging takes that exception and writes it to stderr (see
+        #     logging.Handler.handleError)
+        #
+        # (D) stderr was replaced with a LoggerFileObject at process start,
+        #     so the LoggerFileObject takes the provided string and tells
+        #     its logger to log it (to syslog, naturally).
+        #
+        # Then, steps B through D repeat until we run out of stack.
+        if getattr(self._cls_thread_local, 'already_called_write', False):
+            return
+
+        self._cls_thread_local.already_called_write = True
+        try:
+            value = value.strip()
+            if value:
+                if 'Connection reset by peer' in value:
+                    self.logger.error(
+                        _('%s: Connection reset by peer'), self.log_type)
+                else:
+                    self.logger.error(_('%(type)s: %(value)s'),
+                                      {'type': self.log_type, 'value': value})
+        finally:
+            self._cls_thread_local.already_called_write = False
 
     def writelines(self, values):
-        self.logger.error(_('STDOUT: %s'), '#012'.join(values))
+        if getattr(self._cls_thread_local, 'already_called_writelines', False):
+            return
+
+        self._cls_thread_local.already_called_writelines = True
+        try:
+            self.logger.error(_('%(type)s: %(value)s'),
+                              {'type': self.log_type,
+                               'value': '#012'.join(values)})
+        finally:
+            self._cls_thread_local.already_called_writelines = False
 
     def close(self):
         pass
@@ -395,6 +1456,7 @@ class LoggerFileObject(object):
 
     def next(self):
         raise IOError(errno.EBADF, 'Bad file descriptor')
+    __next__ = next
 
     def read(self, size=-1):
         raise IOError(errno.EBADF, 'Bad file descriptor')
@@ -411,14 +1473,50 @@ class LoggerFileObject(object):
 
 class StatsdClient(object):
     def __init__(self, host, port, base_prefix='', tail_prefix='',
-                 default_sample_rate=1):
+                 default_sample_rate=1, sample_rate_factor=1, logger=None):
         self._host = host
         self._port = port
         self._base_prefix = base_prefix
         self.set_prefix(tail_prefix)
         self._default_sample_rate = default_sample_rate
-        self._target = (self._host, self._port)
+        self._sample_rate_factor = sample_rate_factor
         self.random = random
+        self.logger = logger
+
+        # Determine if host is IPv4 or IPv6
+        addr_info = None
+        try:
+            addr_info = socket.getaddrinfo(host, port, socket.AF_INET)
+            self._sock_family = socket.AF_INET
+        except socket.gaierror:
+            try:
+                addr_info = socket.getaddrinfo(host, port, socket.AF_INET6)
+                self._sock_family = socket.AF_INET6
+            except socket.gaierror:
+                # Don't keep the server from starting from what could be a
+                # transient DNS failure.  Any hostname will get re-resolved as
+                # necessary in the .sendto() calls.
+                # However, we don't know if we're IPv4 or IPv6 in this case, so
+                # we assume legacy IPv4.
+                self._sock_family = socket.AF_INET
+
+        # NOTE: we use the original host value, not the DNS-resolved one
+        # because if host is a hostname, we don't want to cache the DNS
+        # resolution for the entire lifetime of this process.  Let standard
+        # name resolution caching take effect.  This should help operators use
+        # DNS trickery if they want.
+        if addr_info is not None:
+            # addr_info is a list of 5-tuples with the following structure:
+            #     (family, socktype, proto, canonname, sockaddr)
+            # where sockaddr is the only thing of interest to us, and we only
+            # use the first result.  We want to use the originally supplied
+            # host (see note above) and the remainder of the variable-length
+            # sockaddr: IPv4 has (address, port) while IPv6 has (address,
+            # port, flow info, scope id).
+            sockaddr = addr_info[0][-1]
+            self._target = (host,) + (sockaddr[1:])
+        else:
+            self._target = (host, port)
 
     def set_prefix(self, new_prefix):
         if new_prefix and self._base_prefix:
@@ -433,19 +1531,28 @@ class StatsdClient(object):
     def _send(self, m_name, m_value, m_type, sample_rate):
         if sample_rate is None:
             sample_rate = self._default_sample_rate
+        sample_rate = sample_rate * self._sample_rate_factor
         parts = ['%s%s:%s' % (self._prefix, m_name, m_value), m_type]
         if sample_rate < 1:
             if self.random() < sample_rate:
                 parts.append('@%s' % (sample_rate,))
             else:
                 return
+        if six.PY3:
+            parts = [part.encode('utf-8') for part in parts]
         # Ideally, we'd cache a sending socket in self, but that
         # results in a socket getting shared by multiple green threads.
         with closing(self._open_socket()) as sock:
-            return sock.sendto('|'.join(parts), self._target)
+            try:
+                return sock.sendto(b'|'.join(parts), self._target)
+            except IOError as err:
+                if self.logger:
+                    self.logger.warning(
+                        _('Error sending UDP message to %(target)r: %(err)s'),
+                        {'target': self._target, 'err': err})
 
     def _open_socket(self):
-        return socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        return socket.socket(self._sock_family, socket.SOCK_DGRAM)
 
     def update_stats(self, m_name, m_value, sample_rate=None):
         return self._send(m_name, m_value, 'c', sample_rate)
@@ -463,26 +1570,53 @@ class StatsdClient(object):
         return self.timing(metric, (time.time() - orig_time) * 1000,
                            sample_rate)
 
+    def transfer_rate(self, metric, elapsed_time, byte_xfer, sample_rate=None):
+        if byte_xfer:
+            return self.timing(metric,
+                               elapsed_time * 1000 / byte_xfer * 1000,
+                               sample_rate)
 
-def timing_stats(func):
+
+def server_handled_successfully(status_int):
     """
-    Decorator that logs timing events or errors for public methods in swift's
-    wsgi server controllers, based on response code.
+    True for successful responses *or* error codes that are not Swift's fault,
+    False otherwise. For example, 500 is definitely the server's fault, but
+    412 is an error code (4xx are all errors) that is due to a header the
+    client sent.
+
+    If one is tracking error rates to monitor server health, one would be
+    advised to use a function like this one, lest a client cause a flurry of
+    404s or 416s and make a spurious spike in your errors graph.
     """
-    method = func.func_name
+    return (is_success(status_int) or
+            is_redirection(status_int) or
+            status_int == HTTP_NOT_FOUND or
+            status_int == HTTP_PRECONDITION_FAILED or
+            status_int == HTTP_REQUESTED_RANGE_NOT_SATISFIABLE)
 
-    @functools.wraps(func)
-    def _timing_stats(ctrl, *args, **kwargs):
-        start_time = time.time()
-        resp = func(ctrl, *args, **kwargs)
-        if is_success(resp.status_int) or is_redirection(resp.status_int) or \
-                resp.status_int == HTTP_NOT_FOUND:
-            ctrl.logger.timing_since(method + '.timing', start_time)
-        else:
-            ctrl.logger.timing_since(method + '.errors.timing', start_time)
-        return resp
 
-    return _timing_stats
+def timing_stats(**dec_kwargs):
+    """
+    Returns a decorator that logs timing events or errors for public methods in
+    swift's wsgi server controllers, based on response code.
+    """
+    def decorating_func(func):
+        method = func.__name__
+
+        @functools.wraps(func)
+        def _timing_stats(ctrl, *args, **kwargs):
+            start_time = time.time()
+            resp = func(ctrl, *args, **kwargs)
+            if server_handled_successfully(resp.status_int):
+                ctrl.logger.timing_since(method + '.timing',
+                                         start_time, **dec_kwargs)
+            else:
+                ctrl.logger.timing_since(method + '.errors.timing',
+                                         start_time, **dec_kwargs)
+            return resp
+
+        return _timing_stats
+    return decorating_func
 
 
 # double inheritance to support property with setter
@@ -498,7 +1632,7 @@ class LogAdapter(logging.LoggerAdapter, object):
     def __init__(self, logger, server):
         logging.LoggerAdapter.__init__(self, logger, {})
         self.server = server
-        setattr(self, 'warn', self.warning)
+        self.warn = self.warning
 
     @property
     def txn_id(self):
@@ -553,13 +1687,10 @@ class LogAdapter(logging.LoggerAdapter, object):
         _junk, exc, _junk = sys.exc_info()
         call = self.error
         emsg = ''
-        if isinstance(exc, OSError):
+        if isinstance(exc, (OSError, socket.error)):
             if exc.errno in (errno.EIO, errno.ENOSPC):
                 emsg = str(exc)
-            else:
-                call = self._exception
-        elif isinstance(exc, socket.error):
-            if exc.errno == errno.ECONNREFUSED:
+            elif exc.errno == errno.ECONNREFUSED:
                 emsg = _('Connection refused')
             elif exc.errno == errno.EHOSTUNREACH:
                 emsg = _('Host unreachable')
@@ -571,7 +1702,7 @@ class LogAdapter(logging.LoggerAdapter, object):
             emsg = exc.__class__.__name__
             if hasattr(exc, 'seconds'):
                 emsg += ' (%ss)' % exc.seconds
-            if isinstance(exc, MessageTimeout):
+            if isinstance(exc, swift.common.exceptions.MessageTimeout):
                 if exc.msg:
                     emsg += ' %s' % exc.msg
         else:
@@ -590,14 +1721,11 @@ class LogAdapter(logging.LoggerAdapter, object):
 
     def statsd_delegate(statsd_func_name):
         """
-        Factory which creates methods which delegate to methods on
+        Factory to create methods which delegate to methods on
         self.logger.statsd_client (an instance of StatsdClient).  The
         created methods conditionally delegate to a method whose name is given
         in 'statsd_func_name'.  The created delegate methods are a no-op when
-        StatsD logging is not configured.  The created delegate methods also
-        handle the defaulting of sample_rate (to either the default specified
-        in the config with 'log_statsd_default_sample_rate' or the value passed
-        into delegate function).
+        StatsD logging is not configured.
 
         :param statsd_func_name: the name of a method on StatsdClient.
         """
@@ -615,27 +1743,61 @@ class LogAdapter(logging.LoggerAdapter, object):
     decrement = statsd_delegate('decrement')
     timing = statsd_delegate('timing')
     timing_since = statsd_delegate('timing_since')
+    transfer_rate = statsd_delegate('transfer_rate')
 
 
 class SwiftLogFormatter(logging.Formatter):
     """
-    Custom logging.Formatter will append txn_id to a log message if the record
-    has one and the message does not.
+    Custom logging.Formatter will append txn_id to a log message if the
+    record has one and the message does not. Optionally it can shorten
+    overly long log lines.
     """
 
+    def __init__(self, fmt=None, datefmt=None, max_line_length=0):
+        logging.Formatter.__init__(self, fmt=fmt, datefmt=datefmt)
+        self.max_line_length = max_line_length
+
     def format(self, record):
-        msg = logging.Formatter.format(self, record)
-        if (record.txn_id and record.levelno != logging.INFO and
+        if not hasattr(record, 'server'):
+            # Catch log messages that were not initiated by swift
+            # (for example, the keystone auth middleware)
+            record.server = record.name
+
+        # Included from Python's logging.Formatter and then altered slightly to
+        # replace \n with #012
+        record.message = record.getMessage()
+        if self._fmt.find('%(asctime)') >= 0:
+            record.asctime = self.formatTime(record, self.datefmt)
+        msg = (self._fmt % record.__dict__).replace('\n', '#012')
+        if record.exc_info:
+            # Cache the traceback text to avoid converting it multiple times
+            # (it's constant anyway)
+            if not record.exc_text:
+                record.exc_text = self.formatException(
+                    record.exc_info).replace('\n', '#012')
+        if record.exc_text:
+            if not msg.endswith('#012'):
+                msg = msg + '#012'
+            msg = msg + record.exc_text
+
+        if (hasattr(record, 'txn_id') and record.txn_id and
                 record.txn_id not in msg):
             msg = "%s (txn: %s)" % (msg, record.txn_id)
-        if (record.client_ip and record.levelno != logging.INFO and
+        if (hasattr(record, 'client_ip') and record.client_ip and
+                record.levelno != logging.INFO and
                 record.client_ip not in msg):
             msg = "%s (client_ip: %s)" % (msg, record.client_ip)
+        if self.max_line_length > 0 and len(msg) > self.max_line_length:
+            if self.max_line_length < 7:
+                msg = msg[:self.max_line_length]
+            else:
+                approxhalf = (self.max_line_length - 5) // 2
+                msg = msg[:approxhalf] + " ... " + msg[-approxhalf:]
         return msg
 
 
 def get_logger(conf, name=None, log_to_console=False, log_route=None,
-               fmt="%(server)s %(message)s"):
+               fmt="%(server)s: %(message)s"):
     """
     Get the current system logger using config settings.
 
@@ -644,12 +1806,14 @@ def get_logger(conf, name=None, log_to_console=False, log_route=None,
         log_facility = LOG_LOCAL0
         log_level = INFO
         log_name = swift
+        log_max_line_length = 0
         log_udp_host = (disabled)
         log_udp_port = logging.handlers.SYSLOG_UDP_PORT
         log_address = /dev/log
         log_statsd_host = (disabled)
         log_statsd_port = 8125
-        log_statsd_default_sample_rate = 1
+        log_statsd_default_sample_rate = 1.0
+        log_statsd_sample_rate_factor = 1.0
         log_statsd_metric_prefix = (empty-string)
 
     :param conf: Configuration dict to read settings from
@@ -668,7 +1832,8 @@ def get_logger(conf, name=None, log_to_console=False, log_route=None,
     logger = logging.getLogger(log_route)
     logger.propagate = False
     # all new handlers will get the same formatter
-    formatter = SwiftLogFormatter(fmt)
+    formatter = SwiftLogFormatter(
+        fmt=fmt, max_line_length=int(conf.get('log_max_line_length', 0)))
 
     # get_logger will only ever add one SysLog Handler to a logger
     if not hasattr(get_logger, 'handler4logger'):
@@ -681,17 +1846,18 @@ def get_logger(conf, name=None, log_to_console=False, log_route=None,
                        SysLogHandler.LOG_LOCAL0)
     udp_host = conf.get('log_udp_host')
     if udp_host:
-        udp_port = conf.get('log_udp_port', logging.handlers.SYSLOG_UDP_PORT)
+        udp_port = int(conf.get('log_udp_port',
+                                logging.handlers.SYSLOG_UDP_PORT))
         handler = SysLogHandler(address=(udp_host, udp_port),
                                 facility=facility)
     else:
         log_address = conf.get('log_address', '/dev/log')
         try:
             handler = SysLogHandler(address=log_address, facility=facility)
-        except socket.error, e:
+        except socket.error as e:
             # Either /dev/log isn't a UNIX socket or it does not exist at all
-            if e.errno not in [errno.ENOTSOCK,  errno.ENOENT]:
-                raise e
+            if e.errno not in [errno.ENOTSOCK, errno.ENOENT]:
+                raise
             handler = SysLogHandler(facility=facility)
     handler.setFormatter(formatter)
     logger.addHandler(handler)
@@ -721,8 +1887,11 @@ def get_logger(conf, name=None, log_to_console=False, log_route=None,
         base_prefix = conf.get('log_statsd_metric_prefix', '')
         default_sample_rate = float(conf.get(
             'log_statsd_default_sample_rate', 1))
+        sample_rate_factor = float(conf.get(
+            'log_statsd_sample_rate_factor', 1))
         statsd_client = StatsdClient(statsd_host, statsd_port, base_prefix,
-                                     name, default_sample_rate)
+                                     name, default_sample_rate,
+                                     sample_rate_factor, logger=logger)
         logger.statsd_client = statsd_client
     else:
         logger.statsd_client = None
@@ -739,29 +1908,60 @@ def get_logger(conf, name=None, log_to_console=False, log_route=None,
                 logger_hook(conf, name, log_to_console, log_route, fmt,
                             logger, adapted_logger)
             except (AttributeError, ImportError):
-                print >>sys.stderr, 'Error calling custom handler [%s]' % hook
+                print('Error calling custom handler [%s]' % hook,
+                      file=sys.stderr)
             except ValueError:
-                print >>sys.stderr, 'Invalid custom handler format [%s]' % hook
+                print('Invalid custom handler format [%s]' % hook,
+                      file=sys.stderr)
+
     return adapted_logger
 
 
-def drop_privileges(user):
+def get_hub():
+    """
+    Checks whether poll is available and falls back
+    on select if it isn't.
+
+    Note about epoll:
+
+    Review: https://review.openstack.org/#/c/18806/
+
+    There was a problem where once out of every 30 quadrillion
+    connections, a coroutine wouldn't wake up when the client
+    closed its end. Epoll was not reporting the event or it was
+    getting swallowed somewhere. Then when that file descriptor
+    was re-used, eventlet would freak right out because it still
+    thought it was waiting for activity from it in some other coro.
+    """
+    try:
+        import select
+        if hasattr(select, "poll"):
+            return "poll"
+        return "selects"
+    except ImportError:
+        return None
+
+
+def drop_privileges(user, call_setsid=True):
     """
     Sets the userid/groupid of the current process, get session leader, etc.
 
     :param user: User name to change privileges to
     """
-    user = pwd.getpwnam(user)
     if os.geteuid() == 0:
-        os.setgroups([])
+        groups = [g.gr_gid for g in grp.getgrall() if user in g.gr_mem]
+        os.setgroups(groups)
+    user = pwd.getpwnam(user)
     os.setgid(user[3])
     os.setuid(user[2])
-    try:
-        os.setsid()
-    except OSError:
-        pass
-    os.chdir('/')  # in case you need to rmdir on where you started the daemon
-    os.umask(022)  # ensure files are created with the correct privileges
+    os.environ['HOME'] = user[5]
+    if call_setsid:
+        try:
+            os.setsid()
+        except OSError:
+            pass
+    os.chdir('/')   # in case you need to rmdir on where you started the daemon
+    os.umask(0o22)  # ensure files are created with the correct privileges
 
 
 def capture_stdio(logger, **kwargs):
@@ -798,19 +1998,18 @@ def capture_stdio(logger, **kwargs):
     if kwargs.pop('capture_stdout', True):
         sys.stdout = LoggerFileObject(logger)
     if kwargs.pop('capture_stderr', True):
-        sys.stderr = LoggerFileObject(logger)
+        sys.stderr = LoggerFileObject(logger, 'STDERR')
 
 
 def parse_options(parser=None, once=False, test_args=None):
-    """
-    Parse standard swift server/daemon options with optparse.OptionParser.
+    """Parse standard swift server/daemon options with optparse.OptionParser.
 
     :param parser: OptionParser to use. If not sent one will be created.
     :param once: Boolean indicating the "once" option is available
     :param test_args: Override sys.argv; used in testing
 
-    :returns : Tuple of (config, options); config is an absolute path to the
-               config file, options is the parser options as a dictionary.
+    :returns: Tuple of (config, options); config is an absolute path to the
+              config file, options is the parser options as a dictionary.
 
     :raises SystemExit: First arg (CONFIG) is required, file must exist
     """
@@ -827,12 +2026,12 @@ def parse_options(parser=None, once=False, test_args=None):
 
     if not args:
         parser.print_usage()
-        print _("Error: missing config file argument")
+        print(_("Error: missing config path argument"))
         sys.exit(1)
     config = os.path.abspath(args.pop(0))
     if not os.path.exists(config):
         parser.print_usage()
-        print _("Error: unable to locate %s") % config
+        print(_("Error: unable to locate %s") % config)
         sys.exit(1)
 
     extra_args = []
@@ -849,12 +2048,68 @@ def parse_options(parser=None, once=False, test_args=None):
     return config, options
 
 
-def whataremyips():
+def is_valid_ip(ip):
     """
-    Get the machine's ip addresses
+    Return True if the provided ip is a valid IP-address
+    """
+    return is_valid_ipv4(ip) or is_valid_ipv6(ip)
 
+
+def is_valid_ipv4(ip):
+    """
+    Return True if the provided ip is a valid IPv4-address
+    """
+    try:
+        socket.inet_pton(socket.AF_INET, ip)
+    except socket.error:  # not a valid IPv4 address
+        return False
+    return True
+
+
+def is_valid_ipv6(ip):
+    """
+    Returns True if the provided ip is a valid IPv6-address
+    """
+    try:
+        socket.inet_pton(socket.AF_INET6, ip)
+    except socket.error:  # not a valid IPv6 address
+        return False
+    return True
+
+
+def expand_ipv6(address):
+    """
+    Expand ipv6 address.
+    :param address: a string indicating valid ipv6 address
+    :returns: a string indicating fully expanded ipv6 address
+
+    """
+    packed_ip = socket.inet_pton(socket.AF_INET6, address)
+    return socket.inet_ntop(socket.AF_INET6, packed_ip)
+
+
+def whataremyips(bind_ip=None):
+    """
+    Get "our" IP addresses ("us" being the set of services configured by
+    one `*.conf` file). If our REST listens on a specific address, return it.
+    Otherwise, if listen on '0.0.0.0' or '::' return all addresses, including
+    the loopback.
+
+    :param str bind_ip: Optional bind_ip from a config file; may be IP address
+                        or hostname.
     :returns: list of Strings of ip addresses
     """
+    if bind_ip:
+        # See if bind_ip is '0.0.0.0'/'::'
+        try:
+            _, _, _, _, sockaddr = socket.getaddrinfo(
+                bind_ip, None, 0, socket.SOCK_STREAM, 0,
+                socket.AI_NUMERICHOST)[0]
+            if sockaddr[0] not in ('0.0.0.0', '::'):
+                return [bind_ip]
+        except socket.gaierror:
+            pass
+
     addresses = []
     for interface in netifaces.interfaces():
         try:
@@ -863,27 +2118,70 @@ def whataremyips():
                 if family not in (netifaces.AF_INET, netifaces.AF_INET6):
                     continue
                 for address in iface_data[family]:
-                    addresses.append(address['addr'])
+                    addr = address['addr']
+
+                    # If we have an ipv6 address remove the
+                    # %ether_interface at the end
+                    if family == netifaces.AF_INET6:
+                        addr = expand_ipv6(addr.split('%')[0])
+                    addresses.append(addr)
         except ValueError:
             pass
     return addresses
 
 
-def storage_directory(datadir, partition, hash):
+def parse_socket_string(socket_string, default_port):
+    """
+    Given a string representing a socket, returns a tuple of (host, port).
+    Valid strings are DNS names, IPv4 addresses, or IPv6 addresses, with an
+    optional port. If an IPv6 address is specified it **must** be enclosed in
+    [], like *[::1]* or *[::1]:11211*. This follows the accepted prescription
+    for `IPv6 host literals`_.
+
+    Examples::
+
+        server.org
+        server.org:1337
+        127.0.0.1:1337
+        [::1]:1337
+        [::1]
+
+    .. _IPv6 host literals: https://tools.ietf.org/html/rfc3986#section-3.2.2
+    """
+    port = default_port
+    # IPv6 addresses must be between '[]'
+    if socket_string.startswith('['):
+        match = IPV6_RE.match(socket_string)
+        if not match:
+            raise ValueError("Invalid IPv6 address: %s" % socket_string)
+        host = match.group('address')
+        port = match.group('port') or port
+    else:
+        if ':' in socket_string:
+            tokens = socket_string.split(':')
+            if len(tokens) > 2:
+                raise ValueError("IPv6 addresses must be between '[]'")
+            host, port = tokens
+        else:
+            host = socket_string
+    return (host, port)
+
+
+def storage_directory(datadir, partition, name_hash):
     """
     Get the storage directory
 
     :param datadir: Base data directory
     :param partition: Partition
-    :param hash: Account, container or object hash
+    :param name_hash: Account, container or object name hash
     :returns: Storage directory
     """
-    return os.path.join(datadir, str(partition), hash[-3:], hash)
+    return os.path.join(datadir, str(partition), name_hash[-3:], name_hash)
 
 
 def hash_path(account, container=None, object=None, raw_digest=False):
     """
-    Get the connonical hash for an account/container/object
+    Get the canonical hash for an account/container/object
 
     :param account: Account
     :param container: Container
@@ -899,13 +2197,15 @@ def hash_path(account, container=None, object=None, raw_digest=False):
     if object:
         paths.append(object)
     if raw_digest:
-        return md5('/' + '/'.join(paths) + HASH_PATH_SUFFIX).digest()
+        return md5(HASH_PATH_PREFIX + '/' + '/'.join(paths)
+                   + HASH_PATH_SUFFIX).digest()
     else:
-        return md5('/' + '/'.join(paths) + HASH_PATH_SUFFIX).hexdigest()
+        return md5(HASH_PATH_PREFIX + '/' + '/'.join(paths)
+                   + HASH_PATH_SUFFIX).hexdigest()
 
 
 @contextmanager
-def lock_path(directory, timeout=10):
+def lock_path(directory, timeout=10, timeout_class=None):
     """
     Context manager that acquires a lock on a directory.  This will block until
     the lock can be acquired, or the timeout time has expired (whichever occurs
@@ -917,20 +2217,33 @@ def lock_path(directory, timeout=10):
 
     :param directory: directory to be locked
     :param timeout: timeout (in seconds)
+    :param timeout_class: The class of the exception to raise if the
+        lock cannot be granted within the timeout. Will be
+        constructed as timeout_class(timeout, lockpath). Default:
+        LockTimeout
     """
+    if timeout_class is None:
+        timeout_class = swift.common.exceptions.LockTimeout
     mkdirs(directory)
     lockpath = '%s/.lock' % directory
     fd = os.open(lockpath, os.O_WRONLY | os.O_CREAT)
+    sleep_time = 0.01
+    slower_sleep_time = max(timeout * 0.01, sleep_time)
+    slowdown_at = timeout * 0.01
+    time_slept = 0
     try:
-        with LockTimeout(timeout, lockpath):
+        with timeout_class(timeout, lockpath):
             while True:
                 try:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     break
-                except IOError, err:
+                except IOError as err:
                     if err.errno != errno.EAGAIN:
                         raise
-                sleep(0.01)
+                if time_slept > slowdown_at:
+                    sleep_time = slower_sleep_time
+                sleep(sleep_time)
+                time_slept += sleep_time
         yield True
     finally:
         os.close(fd)
@@ -954,26 +2267,32 @@ def lock_file(filename, timeout=10, append=False, unlink=True):
         mode = 'a+'
     else:
         mode = 'r+'
-    fd = os.open(filename, flags)
-    file_obj = os.fdopen(fd, mode)
-    try:
-        with LockTimeout(timeout, filename):
-            while True:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except IOError, err:
-                    if err.errno != errno.EAGAIN:
-                        raise
-                sleep(0.01)
-        yield file_obj
-    finally:
+    while True:
+        fd = os.open(filename, flags)
+        file_obj = os.fdopen(fd, mode)
         try:
+            with swift.common.exceptions.LockTimeout(timeout, filename):
+                while True:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except IOError as err:
+                        if err.errno != errno.EAGAIN:
+                            raise
+                    sleep(0.01)
+            try:
+                if os.stat(filename).st_ino != os.fstat(fd).st_ino:
+                    continue
+            except OSError as err:
+                if err.errno == errno.ENOENT:
+                    continue
+                raise
+            yield file_obj
+            if unlink:
+                os.unlink(filename)
+            break
+        finally:
             file_obj.close()
-        except UnboundLocalError:
-            pass  # may have not actually opened the file
-        if unlink:
-            os.unlink(filename)
 
 
 def lock_parent_directory(filename, timeout=10):
@@ -1022,50 +2341,34 @@ def compute_eta(start_time, current_value, final_value):
     return get_time_units(1.0 / completion * elapsed - elapsed)
 
 
-def iter_devices_partitions(devices_dir, item_type):
-    """
-    Iterate over partitions accross all devices.
-
-    :param devices_dir: Path to devices
-    :param item_type: One of 'accounts', 'containers', or 'objects'
-    :returns: Each iteration returns a tuple of (device, partition)
-    """
-    devices = listdir(devices_dir)
-    shuffle(devices)
-    devices_partitions = []
-    for device in devices:
-        partitions = listdir(os.path.join(devices_dir, device, item_type))
-        shuffle(partitions)
-        devices_partitions.append((device, iter(partitions)))
-    yielded = True
-    while yielded:
-        yielded = False
-        for device, partitions in devices_partitions:
-            try:
-                yield device, partitions.next()
-                yielded = True
-            except StopIteration:
-                pass
-
-
 def unlink_older_than(path, mtime):
     """
     Remove any file in a given path that that was last modified before mtime.
 
     :param path: path to remove file from
-    :mtime: timestamp of oldest file to keep
+    :param mtime: timestamp of oldest file to keep
     """
-    if os.path.exists(path):
-        for fname in listdir(path):
-            fpath = os.path.join(path, fname)
-            try:
-                if os.path.getmtime(fpath) < mtime:
-                    os.unlink(fpath)
-            except OSError:
-                pass
+    filepaths = map(functools.partial(os.path.join, path), listdir(path))
+    return unlink_paths_older_than(filepaths, mtime)
 
 
-def item_from_env(env, item_name):
+def unlink_paths_older_than(filepaths, mtime):
+    """
+    Remove any files from the given list that that were
+    last modified before mtime.
+
+    :param filepaths: a list of strings, the full paths of files to check
+    :param mtime: timestamp of oldest file to keep
+    """
+    for fpath in filepaths:
+        try:
+            if os.path.getmtime(fpath) < mtime:
+                os.unlink(fpath)
+        except OSError:
+            pass
+
+
+def item_from_env(env, item_name, allow_none=False):
     """
     Get a value from the wsgi environment
 
@@ -1075,12 +2378,12 @@ def item_from_env(env, item_name):
     :returns: the value from the environment
     """
     item = env.get(item_name, None)
-    if item is None:
-        logging.error("ERROR: %s could not be found in env!" % item_name)
+    if item is None and not allow_none:
+        logging.error("ERROR: %s could not be found in env!", item_name)
     return item
 
 
-def cache_from_env(env):
+def cache_from_env(env, allow_none=False):
     """
     Get memcache connection pool from the environment (which had been
     previously set by the memcache middleware
@@ -1089,22 +2392,32 @@ def cache_from_env(env):
 
     :returns: swift.common.memcached.MemcacheRing from environment
     """
-    return item_from_env(env, 'swift.cache')
+    return item_from_env(env, 'swift.cache', allow_none)
 
 
-def readconf(conffile, section_name=None, log_name=None, defaults=None,
+def read_conf_dir(parser, conf_dir):
+    conf_files = []
+    for f in os.listdir(conf_dir):
+        if f.endswith('.conf') and not f.startswith('.'):
+            conf_files.append(os.path.join(conf_dir, f))
+    return parser.read(sorted(conf_files))
+
+
+def readconf(conf_path, section_name=None, log_name=None, defaults=None,
              raw=False):
     """
-    Read config file and return config items as a dict
+    Read config file(s) and return config items as a dict
 
-    :param conffile: path to config file, or a file-like object (hasattr
-                     readline)
+    :param conf_path: path to config file/directory, or a file-like object
+                     (hasattr readline)
     :param section_name: config section to read (will return all sections if
                      not defined)
     :param log_name: name to be used with logging (will use section_name if
                      not defined)
     :param defaults: dict of default values to pre-populate the config with
     :returns: dict of config items
+    :raises ValueError: if section_name does not exist
+    :raises IOError: if reading the file failed
     """
     if defaults is None:
         defaults = {}
@@ -1112,19 +2425,24 @@ def readconf(conffile, section_name=None, log_name=None, defaults=None,
         c = RawConfigParser(defaults)
     else:
         c = ConfigParser(defaults)
-    if hasattr(conffile, 'readline'):
-        c.readfp(conffile)
+    if hasattr(conf_path, 'readline'):
+        c.readfp(conf_path)
     else:
-        if not c.read(conffile):
-            print _("Unable to read config file %s") % conffile
-            sys.exit(1)
+        if os.path.isdir(conf_path):
+            # read all configs in directory
+            success = read_conf_dir(c, conf_path)
+        else:
+            success = c.read(conf_path)
+        if not success:
+            raise IOError(_("Unable to read config from %s") %
+                          conf_path)
     if section_name:
         if c.has_section(section_name):
             conf = dict(c.items(section_name))
         else:
-            print _("Unable to find %s config section in %s") % \
-                (section_name, conffile)
-            sys.exit(1)
+            raise ValueError(
+                _("Unable to find %(section)s config section in %(conf)s") %
+                {'section': section_name, 'conf': conf_path})
         if "log_name" not in conf:
             if log_name is not None:
                 conf['log_name'] = log_name
@@ -1136,7 +2454,7 @@ def readconf(conffile, section_name=None, log_name=None, defaults=None,
             conf.update({s: dict(c.items(s))})
         if 'log_name' not in conf:
             conf['log_name'] = log_name
-    conf['__file__'] = conffile
+    conf['__file__'] = conf_path
     return conf
 
 
@@ -1153,6 +2471,7 @@ def write_pickle(obj, dest, tmp=None, pickle_protocol=0):
     """
     if tmp is None:
         tmp = os.path.dirname(dest)
+    mkdirs(tmp)
     fd, tmppath = mkstemp(dir=tmp, suffix='.tmp')
     with os.fdopen(fd, 'wb') as fo:
         pickle.dump(obj, fo, pickle_protocol)
@@ -1161,27 +2480,48 @@ def write_pickle(obj, dest, tmp=None, pickle_protocol=0):
         renamer(tmppath, dest)
 
 
-def search_tree(root, glob_match, ext):
-    """Look in root, for any files/dirs matching glob, recurively traversing
+def search_tree(root, glob_match, ext='', exts=None, dir_ext=None):
+    """Look in root, for any files/dirs matching glob, recursively traversing
     any found directories looking for files ending with ext
 
     :param root: start of search path
     :param glob_match: glob to match in root, matching dirs are traversed with
                        os.walk
     :param ext: only files that end in ext will be returned
+    :param exts: a list of file extensions; only files that end in one of these
+                 extensions will be returned; if set this list overrides any
+                 extension specified using the 'ext' param.
+    :param dir_ext: if present directories that end with dir_ext will not be
+                    traversed and instead will be returned as a matched path
 
     :returns: list of full paths to matching files, sorted
 
     """
+    exts = exts or [ext]
     found_files = []
     for path in glob.glob(os.path.join(root, glob_match)):
-        if path.endswith(ext):
-            found_files.append(path)
-        else:
+        if os.path.isdir(path):
             for root, dirs, files in os.walk(path):
-                for file in files:
-                    if file.endswith(ext):
-                        found_files.append(os.path.join(root, file))
+                if dir_ext and root.endswith(dir_ext):
+                    found_files.append(root)
+                    # the root is a config dir, descend no further
+                    break
+                for file_ in files:
+                    if any(exts) and not any(file_.endswith(e) for e in exts):
+                        continue
+                    found_files.append(os.path.join(root, file_))
+                found_dir = False
+                for dir_ in dirs:
+                    if dir_ext and dir_.endswith(dir_ext):
+                        found_dir = True
+                        found_files.append(os.path.join(root, dir_))
+                if found_dir:
+                    # do not descend further into matching directories
+                    break
+        else:
+            if ext and not path.endswith(ext):
+                continue
+            found_files.append(path)
     return sorted(found_files)
 
 
@@ -1196,7 +2536,7 @@ def write_file(path, contents):
     if not os.path.exists(dirname):
         try:
             os.makedirs(dirname)
-        except OSError, err:
+        except OSError as err:
             if err.errno == errno.EACCES:
                 sys.exit('Unable to create %s.  Running as '
                          'non-root?' % dirname)
@@ -1215,7 +2555,8 @@ def remove_file(path):
         pass
 
 
-def audit_location_generator(devices, datadir, mount_check=True, logger=None):
+def audit_location_generator(devices, datadir, suffix='',
+                             mount_check=True, logger=None):
     '''
     Given a devices path and a data directory, yield (path, device,
     partition) for all files in that directory
@@ -1224,6 +2565,7 @@ def audit_location_generator(devices, datadir, mount_check=True, logger=None):
     :param datadir: a directory located under self.devices. This should be
                     one of the DATADIR constants defined in the account,
                     container, and object servers.
+    :param suffix: path name suffix required for all names returned
     :param mount_check: Flag to check if a mount check should be performed
                     on devices
     :param logger: a logger object
@@ -1232,32 +2574,46 @@ def audit_location_generator(devices, datadir, mount_check=True, logger=None):
     # randomize devices in case of process restart before sweep completed
     shuffle(device_dir)
     for device in device_dir:
-        if mount_check and not \
-                os.path.ismount(os.path.join(devices, device)):
+        if mount_check and not ismount(os.path.join(devices, device)):
             if logger:
-                logger.debug(
+                logger.warning(
                     _('Skipping %s as it is not mounted'), device)
             continue
         datadir_path = os.path.join(devices, device, datadir)
-        if not os.path.exists(datadir_path):
+        try:
+            partitions = listdir(datadir_path)
+        except OSError as e:
+            if logger:
+                logger.warning(_('Skipping %(datadir)s because %(err)s'),
+                               {'datadir': datadir_path, 'err': e})
             continue
-        partitions = listdir(datadir_path)
         for partition in partitions:
             part_path = os.path.join(datadir_path, partition)
-            if not os.path.isdir(part_path):
+            try:
+                suffixes = listdir(part_path)
+            except OSError as e:
+                if e.errno != errno.ENOTDIR:
+                    raise
                 continue
-            suffixes = listdir(part_path)
-            for suffix in suffixes:
-                suff_path = os.path.join(part_path, suffix)
-                if not os.path.isdir(suff_path):
+            for asuffix in suffixes:
+                suff_path = os.path.join(part_path, asuffix)
+                try:
+                    hashes = listdir(suff_path)
+                except OSError as e:
+                    if e.errno != errno.ENOTDIR:
+                        raise
                     continue
-                hashes = listdir(suff_path)
                 for hsh in hashes:
                     hash_path = os.path.join(suff_path, hsh)
-                    if not os.path.isdir(hash_path):
+                    try:
+                        files = sorted(listdir(hash_path), reverse=True)
+                    except OSError as e:
+                        if e.errno != errno.ENOTDIR:
+                            raise
                         continue
-                    for fname in sorted(listdir(hash_path),
-                                        reverse=True):
+                    for fname in files:
+                        if suffix and not fname.endswith(suffix):
+                            continue
                         path = os.path.join(hash_path, fname)
                         yield path, device, partition
 
@@ -1270,26 +2626,41 @@ def ratelimit_sleep(running_time, max_rate, incr_by=1, rate_buffer=5):
     as eventlet.sleep() does involve some overhead.  Returns running_time
     that should be used for subsequent calls.
 
-    :param running_time: the running time of the next allowable request. Best
-                         to start at zero.
+    :param running_time: the running time in milliseconds of the next
+                         allowable request. Best to start at zero.
     :param max_rate: The maximum rate per second allowed for the process.
     :param incr_by: How much to increment the counter.  Useful if you want
                     to ratelimit 1024 bytes/sec and have differing sizes
-                    of requests. Must be >= 0.
+                    of requests. Must be > 0 to engage rate-limiting
+                    behavior.
     :param rate_buffer: Number of seconds the rate counter can drop and be
                         allowed to catch up (at a faster than listed rate).
                         A larger number will result in larger spikes in rate
-                        but better average accuracy.
+                        but better average accuracy. Must be > 0 to engage
+                        rate-limiting behavior.
     '''
-    if not max_rate or incr_by <= 0:
+    if max_rate <= 0 or incr_by <= 0:
         return running_time
+
+    # 1,000 milliseconds = 1 second
     clock_accuracy = 1000.0
+
+    # Convert seconds to milliseconds
     now = time.time() * clock_accuracy
+
+    # Calculate time per request in milliseconds
     time_per_request = clock_accuracy * (float(incr_by) / max_rate)
+
+    # Convert rate_buffer to milliseconds and compare
     if now - running_time > rate_buffer * clock_accuracy:
         running_time = now
     elif running_time - now > time_per_request:
+        # Convert diff back to a floating point number of seconds and sleep
         eventlet.sleep((running_time - now) / clock_accuracy)
+
+    # Return the absolute time for the next interval in milliseconds; note
+    # that time could have passed well beyond that point, but the next call
+    # will catch that and skip the sleep.
     return running_time + time_per_request
 
 
@@ -1302,6 +2673,141 @@ class ContextPool(GreenPool):
     def __exit__(self, type, value, traceback):
         for coro in list(self.coroutines_running):
             coro.kill()
+
+
+class GreenAsyncPileWaitallTimeout(Timeout):
+    pass
+
+
+class GreenAsyncPile(object):
+    """
+    Runs jobs in a pool of green threads, and the results can be retrieved by
+    using this object as an iterator.
+
+    This is very similar in principle to eventlet.GreenPile, except it returns
+    results as they become available rather than in the order they were
+    launched.
+
+    Correlating results with jobs (if necessary) is left to the caller.
+    """
+    def __init__(self, size_or_pool):
+        """
+        :param size_or_pool: thread pool size or a pool to use
+        """
+        if isinstance(size_or_pool, GreenPool):
+            self._pool = size_or_pool
+            size = self._pool.size
+        else:
+            self._pool = GreenPool(size_or_pool)
+            size = size_or_pool
+        self._responses = eventlet.queue.LightQueue(size)
+        self._inflight = 0
+        self._pending = 0
+
+    def _run_func(self, func, args, kwargs):
+        try:
+            self._responses.put(func(*args, **kwargs))
+        finally:
+            self._inflight -= 1
+
+    @property
+    def inflight(self):
+        return self._inflight
+
+    def spawn(self, func, *args, **kwargs):
+        """
+        Spawn a job in a green thread on the pile.
+        """
+        self._pending += 1
+        self._inflight += 1
+        self._pool.spawn(self._run_func, func, args, kwargs)
+
+    def waitfirst(self, timeout):
+        """
+        Wait up to timeout seconds for first result to come in.
+
+        :param timeout: seconds to wait for results
+        :returns: first item to come back, or None
+        """
+        for result in self._wait(timeout, first_n=1):
+            return result
+
+    def waitall(self, timeout):
+        """
+        Wait timeout seconds for any results to come in.
+
+        :param timeout: seconds to wait for results
+        :returns: list of results accrued in that time
+        """
+        return self._wait(timeout)
+
+    def _wait(self, timeout, first_n=None):
+        results = []
+        try:
+            with GreenAsyncPileWaitallTimeout(timeout):
+                while True:
+                    results.append(next(self))
+                    if first_n and len(results) >= first_n:
+                        break
+        except (GreenAsyncPileWaitallTimeout, StopIteration):
+            pass
+        return results
+
+    def __iter__(self):
+        return self
+
+    def next(self):
+        try:
+            rv = self._responses.get_nowait()
+        except eventlet.queue.Empty:
+            if self._inflight == 0:
+                raise StopIteration()
+            rv = self._responses.get()
+        self._pending -= 1
+        return rv
+    __next__ = next
+
+
+class StreamingPile(GreenAsyncPile):
+    """
+    Runs jobs in a pool of green threads, spawning more jobs as results are
+    retrieved and worker threads become available.
+
+    When used as a context manager, has the same worker-killing properties as
+    :class:`ContextPool`.
+    """
+    def __init__(self, size):
+        """:param size: number of worker threads to use"""
+        self.pool = ContextPool(size)
+        super(StreamingPile, self).__init__(self.pool)
+
+    def asyncstarmap(self, func, args_iter):
+        """
+        This is the same as :func:`itertools.starmap`, except that *func* is
+        executed in a separate green thread for each item, and results won't
+        necessarily have the same order as inputs.
+        """
+        args_iter = iter(args_iter)
+
+        # Initialize the pile
+        for args in itertools.islice(args_iter, self.pool.size):
+            self.spawn(func, *args)
+
+        # Keep populating the pile as greenthreads become available
+        for args in args_iter:
+            yield next(self)
+            self.spawn(func, *args)
+
+        # Drain the pile
+        for result in self:
+            yield result
+
+    def __enter__(self):
+        self.pool.__enter__()
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self.pool.__exit__(type, value, traceback)
 
 
 class ModifiedParseResult(ParseResult):
@@ -1336,21 +2842,173 @@ def urlparse(url):
     return ModifiedParseResult(*stdlib_urlparse(url))
 
 
-def validate_sync_to(value, allowed_sync_hosts):
+def validate_sync_to(value, allowed_sync_hosts, realms_conf):
+    """
+    Validates an X-Container-Sync-To header value, returning the
+    validated endpoint, realm, and realm_key, or an error string.
+
+    :param value: The X-Container-Sync-To header value to validate.
+    :param allowed_sync_hosts: A list of allowed hosts in endpoints,
+        if realms_conf does not apply.
+    :param realms_conf: A instance of
+        swift.common.container_sync_realms.ContainerSyncRealms to
+        validate against.
+    :returns: A tuple of (error_string, validated_endpoint, realm,
+        realm_key). The error_string will None if the rest of the
+        values have been validated. The validated_endpoint will be
+        the validated endpoint to sync to. The realm and realm_key
+        will be set if validation was done through realms_conf.
+    """
+    orig_value = value
+    value = value.rstrip('/')
     if not value:
-        return None
+        return (None, None, None, None)
+    if value.startswith('//'):
+        if not realms_conf:
+            return (None, None, None, None)
+        data = value[2:].split('/')
+        if len(data) != 4:
+            return (
+                _('Invalid X-Container-Sync-To format %r') % orig_value,
+                None, None, None)
+        realm, cluster, account, container = data
+        realm_key = realms_conf.key(realm)
+        if not realm_key:
+            return (_('No realm key for %r') % realm, None, None, None)
+        endpoint = realms_conf.endpoint(realm, cluster)
+        if not endpoint:
+            return (
+                _('No cluster endpoint for %(realm)r %(cluster)r')
+                % {'realm': realm, 'cluster': cluster},
+                None, None, None)
+        return (
+            None,
+            '%s/%s/%s' % (endpoint.rstrip('/'), account, container),
+            realm.upper(), realm_key)
     p = urlparse(value)
     if p.scheme not in ('http', 'https'):
-        return _('Invalid scheme %r in X-Container-Sync-To, must be "http" '
-                 'or "https".') % p.scheme
+        return (
+            _('Invalid scheme %r in X-Container-Sync-To, must be "//", '
+              '"http", or "https".') % p.scheme,
+            None, None, None)
     if not p.path:
-        return _('Path required in X-Container-Sync-To')
+        return (_('Path required in X-Container-Sync-To'), None, None, None)
     if p.params or p.query or p.fragment:
-        return _('Params, queries, and fragments not allowed in '
-                 'X-Container-Sync-To')
+        return (
+            _('Params, queries, and fragments not allowed in '
+              'X-Container-Sync-To'),
+            None, None, None)
     if p.hostname not in allowed_sync_hosts:
-        return _('Invalid host %r in X-Container-Sync-To') % p.hostname
-    return None
+        return (
+            _('Invalid host %r in X-Container-Sync-To') % p.hostname,
+            None, None, None)
+    return (None, value, None, None)
+
+
+def affinity_key_function(affinity_str):
+    """Turns an affinity config value into a function suitable for passing to
+    sort(). After doing so, the array will be sorted with respect to the given
+    ordering.
+
+    For example, if affinity_str is "r1=1, r2z7=2, r2z8=2", then the array
+    will be sorted with all nodes from region 1 (r1=1) first, then all the
+    nodes from region 2 zones 7 and 8 (r2z7=2 and r2z8=2), then everything
+    else.
+
+    Note that the order of the pieces of affinity_str is irrelevant; the
+    priority values are what comes after the equals sign.
+
+    If affinity_str is empty or all whitespace, then the resulting function
+    will not alter the ordering of the nodes.
+
+    :param affinity_str: affinity config value, e.g. "r1z2=3"
+                         or "r1=1, r2z1=2, r2z2=2"
+    :returns: single-argument function
+    :raises: ValueError if argument invalid
+    """
+    affinity_str = affinity_str.strip()
+
+    if not affinity_str:
+        return lambda x: 0
+
+    priority_matchers = []
+    pieces = [s.strip() for s in affinity_str.split(',')]
+    for piece in pieces:
+        # matches r<number>=<number> or r<number>z<number>=<number>
+        match = re.match("r(\d+)(?:z(\d+))?=(\d+)$", piece)
+        if match:
+            region, zone, priority = match.groups()
+            region = int(region)
+            priority = int(priority)
+            zone = int(zone) if zone else None
+
+            matcher = {'region': region, 'priority': priority}
+            if zone is not None:
+                matcher['zone'] = zone
+            priority_matchers.append(matcher)
+        else:
+            raise ValueError("Invalid affinity value: %r" % affinity_str)
+
+    priority_matchers.sort(key=operator.itemgetter('priority'))
+
+    def keyfn(ring_node):
+        for matcher in priority_matchers:
+            if (matcher['region'] == ring_node['region']
+                and ('zone' not in matcher
+                     or matcher['zone'] == ring_node['zone'])):
+                return matcher['priority']
+        return 4294967296  # 2^32, i.e. "a big number"
+    return keyfn
+
+
+def affinity_locality_predicate(write_affinity_str):
+    """
+    Turns a write-affinity config value into a predicate function for nodes.
+    The returned value will be a 1-arg function that takes a node dictionary
+    and returns a true value if it is "local" and a false value otherwise. The
+    definition of "local" comes from the affinity_str argument passed in here.
+
+    For example, if affinity_str is "r1, r2z2", then only nodes where region=1
+    or where (region=2 and zone=2) are considered local.
+
+    If affinity_str is empty or all whitespace, then the resulting function
+    will consider everything local
+
+    :param affinity_str: affinity config value, e.g. "r1z2"
+        or "r1, r2z1, r2z2"
+    :returns: single-argument function, or None if affinity_str is empty
+    :raises: ValueError if argument invalid
+    """
+    affinity_str = write_affinity_str.strip()
+
+    if not affinity_str:
+        return None
+
+    matchers = []
+    pieces = [s.strip() for s in affinity_str.split(',')]
+    for piece in pieces:
+        # matches r<number> or r<number>z<number>
+        match = re.match("r(\d+)(?:z(\d+))?$", piece)
+        if match:
+            region, zone = match.groups()
+            region = int(region)
+            zone = int(zone) if zone else None
+
+            matcher = {'region': region}
+            if zone is not None:
+                matcher['zone'] = zone
+            matchers.append(matcher)
+        else:
+            raise ValueError("Invalid write-affinity value: %r" % affinity_str)
+
+    def is_local(ring_node):
+        for matcher in matchers:
+            if (matcher['region'] == ring_node['region']
+                and ('zone' not in matcher
+                     or matcher['zone'] == ring_node['zone'])):
+                return True
+        return False
+    return is_local
 
 
 def get_remote_client(req):
@@ -1379,13 +3037,38 @@ def human_readable(value):
     return '%d%si' % (round(value), suffixes[index])
 
 
-def dump_recon_cache(cache_dict, cache_file, logger, lock_timeout=2):
+def put_recon_cache_entry(cache_entry, key, item):
+    """
+    Function that will check if item is a dict, and if so put it under
+    cache_entry[key].  We use nested recon cache entries when the object
+    auditor runs in parallel or else in 'once' mode with a specified
+    subset of devices.
+    """
+    if isinstance(item, dict):
+        if key not in cache_entry or key in cache_entry and not \
+                isinstance(cache_entry[key], dict):
+            cache_entry[key] = {}
+        elif key in cache_entry and item == {}:
+            cache_entry.pop(key, None)
+            return
+        for k, v in item.items():
+            if v == {}:
+                cache_entry[key].pop(k, None)
+            else:
+                cache_entry[key][k] = v
+    else:
+        cache_entry[key] = item
+
+
+def dump_recon_cache(cache_dict, cache_file, logger, lock_timeout=2,
+                     set_owner=None):
     """Update recon cache values
 
     :param cache_dict: Dictionary of cache key/value pairs to write out
     :param cache_file: cache file to update
     :param logger: the logger to use to log an encountered error
     :param lock_timeout: timeout (in seconds)
+    :param set_owner: Set owner of recon cache file
     """
     try:
         with lock_file(cache_file, lock_timeout, unlink=False) as cf:
@@ -1395,21 +3078,25 @@ def dump_recon_cache(cache_dict, cache_file, logger, lock_timeout=2):
                 if existing_entry:
                     cache_entry = json.loads(existing_entry)
             except ValueError:
-                #file doesn't have a valid entry, we'll recreate it
+                # file doesn't have a valid entry, we'll recreate it
                 pass
             for cache_key, cache_value in cache_dict.items():
-                cache_entry[cache_key] = cache_value
+                put_recon_cache_entry(cache_entry, cache_key, cache_value)
+            tf = None
             try:
                 with NamedTemporaryFile(dir=os.path.dirname(cache_file),
                                         delete=False) as tf:
                     tf.write(json.dumps(cache_entry) + '\n')
-                os.rename(tf.name, cache_file)
+                if set_owner:
+                    os.chown(tf.name, pwd.getpwnam(set_owner).pw_uid, -1)
+                renamer(tf.name, cache_file, fsync=False)
             finally:
-                try:
-                    os.unlink(tf.name)
-                except OSError, err:
-                    if err.errno != errno.ENOENT:
-                        raise
+                if tf is not None:
+                    try:
+                        os.unlink(tf.name)
+                    except OSError as err:
+                        if err.errno != errno.ENOENT:
+                            raise
     except (Exception, Timeout):
         logger.exception(_('Exception dumping recon cache'))
 
@@ -1417,7 +3104,7 @@ def dump_recon_cache(cache_dict, cache_file, logger, lock_timeout=2):
 def listdir(path):
     try:
         return os.listdir(path)
-    except OSError, err:
+    except OSError as err:
         if err.errno != errno.ENOENT:
             raise
     return []
@@ -1443,6 +3130,36 @@ def streq_const_time(s1, s2):
     return result == 0
 
 
+def pairs(item_list):
+    """
+    Returns an iterator of all pairs of elements from item_list.
+
+    :param items: items (no duplicates allowed)
+    """
+    for i, item1 in enumerate(item_list):
+        for item2 in item_list[(i + 1):]:
+            yield (item1, item2)
+
+
+def replication(func):
+    """
+    Decorator to declare which methods are accessible for different
+    type of servers:
+
+    * If option replication_server is None then this decorator
+      doesn't matter.
+    * If option replication_server is True then ONLY decorated with
+      this decorator methods will be started.
+    * If option replication_server is False then decorated with this
+      decorator methods will NOT be started.
+
+    :param func: function to mark accessible for replication
+    """
+    func.replication = True
+
+    return func
+
+
 def public(func):
     """
     Decorator to declare which methods are publicly accessible as HTTP
@@ -1451,11 +3168,23 @@ def public(func):
     :param func: function to make public
     """
     func.publicly_accessible = True
+    return func
 
-    @functools.wraps(func)
-    def wrapped(*a, **kw):
-        return func(*a, **kw)
-    return wrapped
+
+def majority_size(n):
+    return (n // 2) + 1
+
+
+def quorum_size(n):
+    """
+    quorum size as it applies to services that use 'replication' for data
+    integrity  (Account/Container services).  Object quorum_size is defined
+    on a storage policy basis.
+
+    Number of successful backend requests needed for the proxy to consider
+    the client request successful.
+    """
+    return (n + 1) // 2
 
 
 def rsync_ip(ip):
@@ -1469,12 +3198,34 @@ def rsync_ip(ip):
 
     :returns: a string ip address
     """
+    return '[%s]' % ip if is_valid_ipv6(ip) else ip
+
+
+def rsync_module_interpolation(template, device):
+    """
+    Interpolate devices variables inside a rsync module template
+
+    :param template: rsync module template as a string
+    :param device: a device from a ring
+
+    :returns: a string with all variables replaced by device attributes
+    """
+    replacements = {
+        'ip': rsync_ip(device.get('ip', '')),
+        'port': device.get('port', ''),
+        'replication_ip': rsync_ip(device.get('replication_ip', '')),
+        'replication_port': device.get('replication_port', ''),
+        'region': device.get('region', ''),
+        'zone': device.get('zone', ''),
+        'device': device.get('device', ''),
+        'meta': device.get('meta', ''),
+    }
     try:
-        socket.inet_pton(socket.AF_INET6, ip)
-    except socket.error:  # it's IPv4
-        return ip
-    else:
-        return '[%s]' % ip
+        module = template.format(**replacements)
+    except KeyError as e:
+        raise ValueError('Cannot interpolate rsync_module, invalid variable: '
+                         '%s' % e)
+    return module
 
 
 def get_valid_utf8_str(str_or_unicode):
@@ -1483,7 +3234,7 @@ def get_valid_utf8_str(str_or_unicode):
 
     :param str_or_unicode: a string or an unicode which can be invalid utf-8
     """
-    if isinstance(str_or_unicode, unicode):
+    if isinstance(str_or_unicode, six.text_type):
         (str_or_unicode, _len) = utf8_encoder(str_or_unicode, 'replace')
     (valid_utf8_str, _len) = utf8_decoder(str_or_unicode, 'replace')
     return valid_utf8_str.encode('utf-8')
@@ -1497,6 +3248,36 @@ def list_from_csv(comma_separated_str):
     if comma_separated_str:
         return [v.strip() for v in comma_separated_str.split(',') if v.strip()]
     return []
+
+
+def csv_append(csv_string, item):
+    """
+    Appends an item to a comma-separated string.
+
+    If the comma-separated string is empty/None, just returns item.
+    """
+    if csv_string:
+        return ",".join((csv_string, item))
+    else:
+        return item
+
+
+class CloseableChain(object):
+    """
+    Like itertools.chain, but with a close method that will attempt to invoke
+    its sub-iterators' close methods, if any.
+    """
+    def __init__(self, *iterables):
+        self.iterables = iterables
+
+    def __iter__(self):
+        return iter(itertools.chain(*(self.iterables)))
+
+    def close(self):
+        for it in self.iterables:
+            close_method = getattr(it, 'close', None)
+            if close_method:
+                close_method()
 
 
 def reiterate(iterable):
@@ -1514,7 +3295,910 @@ def reiterate(iterable):
         try:
             chunk = ''
             while not chunk:
-                chunk = next(iterable)
-            return itertools.chain([chunk], iterable)
+                chunk = next(iterator)
+            return CloseableChain([chunk], iterator)
         except StopIteration:
             return []
+
+
+class InputProxy(object):
+    """
+    File-like object that counts bytes read.
+    To be swapped in for wsgi.input for accounting purposes.
+    """
+    def __init__(self, wsgi_input):
+        """
+        :param wsgi_input: file-like object to wrap the functionality of
+        """
+        self.wsgi_input = wsgi_input
+        self.bytes_received = 0
+        self.client_disconnect = False
+
+    def read(self, *args, **kwargs):
+        """
+        Pass read request to the underlying file-like object and
+        add bytes read to total.
+        """
+        try:
+            chunk = self.wsgi_input.read(*args, **kwargs)
+        except Exception:
+            self.client_disconnect = True
+            raise
+        self.bytes_received += len(chunk)
+        return chunk
+
+    def readline(self, *args, **kwargs):
+        """
+        Pass readline request to the underlying file-like object and
+        add bytes read to total.
+        """
+        try:
+            line = self.wsgi_input.readline(*args, **kwargs)
+        except Exception:
+            self.client_disconnect = True
+            raise
+        self.bytes_received += len(line)
+        return line
+
+
+class LRUCache(object):
+    """
+    Decorator for size/time bound memoization that evicts the least
+    recently used members.
+    """
+
+    PREV, NEXT, KEY, CACHED_AT, VALUE = 0, 1, 2, 3, 4  # link fields
+
+    def __init__(self, maxsize=1000, maxtime=3600):
+        self.maxsize = maxsize
+        self.maxtime = maxtime
+        self.reset()
+
+    def reset(self):
+        self.mapping = {}
+        self.head = [None, None, None, None, None]  # oldest
+        self.tail = [self.head, None, None, None, None]  # newest
+        self.head[self.NEXT] = self.tail
+
+    def set_cache(self, value, *key):
+        while len(self.mapping) >= self.maxsize:
+            old_next, old_key = self.head[self.NEXT][self.NEXT:self.NEXT + 2]
+            self.head[self.NEXT], old_next[self.PREV] = old_next, self.head
+            del self.mapping[old_key]
+        last = self.tail[self.PREV]
+        link = [last, self.tail, key, time.time(), value]
+        self.mapping[key] = last[self.NEXT] = self.tail[self.PREV] = link
+        return value
+
+    def get_cached(self, link, *key):
+        link_prev, link_next, key, cached_at, value = link
+        if cached_at + self.maxtime < time.time():
+            raise KeyError('%r has timed out' % (key,))
+        link_prev[self.NEXT] = link_next
+        link_next[self.PREV] = link_prev
+        last = self.tail[self.PREV]
+        last[self.NEXT] = self.tail[self.PREV] = link
+        link[self.PREV] = last
+        link[self.NEXT] = self.tail
+        return value
+
+    def __call__(self, f):
+
+        class LRUCacheWrapped(object):
+
+            @functools.wraps(f)
+            def __call__(im_self, *key):
+                link = self.mapping.get(key, self.head)
+                if link is not self.head:
+                    try:
+                        return self.get_cached(link, *key)
+                    except KeyError:
+                        pass
+                value = f(*key)
+                self.set_cache(value, *key)
+                return value
+
+            def size(im_self):
+                """
+                Return the size of the cache
+                """
+                return len(self.mapping)
+
+            def reset(im_self):
+                return self.reset()
+
+            def get_maxsize(im_self):
+                return self.maxsize
+
+            def set_maxsize(im_self, i):
+                self.maxsize = i
+
+            def get_maxtime(im_self):
+                return self.maxtime
+
+            def set_maxtime(im_self, i):
+                self.maxtime = i
+
+            maxsize = property(get_maxsize, set_maxsize)
+            maxtime = property(get_maxtime, set_maxtime)
+
+            def __repr__(im_self):
+                return '<%s %r>' % (im_self.__class__.__name__, f)
+
+        return LRUCacheWrapped()
+
+
+class Spliterator(object):
+    """
+    Takes an iterator yielding sliceable things (e.g. strings or lists) and
+    yields subiterators, each yielding up to the requested number of items
+    from the source.
+
+    >>> si = Spliterator(["abcde", "fg", "hijkl"])
+    >>> ''.join(si.take(4))
+    "abcd"
+    >>> ''.join(si.take(3))
+    "efg"
+    >>> ''.join(si.take(1))
+    "h"
+    >>> ''.join(si.take(3))
+    "ijk"
+    >>> ''.join(si.take(3))
+    "l"  # shorter than requested; this can happen with the last iterator
+
+    """
+    def __init__(self, source_iterable):
+        self.input_iterator = iter(source_iterable)
+        self.leftovers = None
+        self.leftovers_index = 0
+        self._iterator_in_progress = False
+
+    def take(self, n):
+        if self._iterator_in_progress:
+            raise ValueError(
+                "cannot call take() again until the first iterator is"
+                " exhausted (has raised StopIteration)")
+        self._iterator_in_progress = True
+
+        try:
+            if self.leftovers:
+                # All this string slicing is a little awkward, but it's for
+                # a good reason. Consider a length N string that someone is
+                # taking k bytes at a time.
+                #
+                # With this implementation, we create one new string of
+                # length k (copying the bytes) on each call to take(). Once
+                # the whole input has been consumed, each byte has been
+                # copied exactly once, giving O(N) bytes copied.
+                #
+                # If, instead of this, we were to set leftovers =
+                # leftovers[k:] and omit leftovers_index, then each call to
+                # take() would copy k bytes to create the desired substring,
+                # then copy all the remaining bytes to reset leftovers,
+                # resulting in an overall O(N^2) bytes copied.
+                llen = len(self.leftovers) - self.leftovers_index
+                if llen <= n:
+                    n -= llen
+                    to_yield = self.leftovers[self.leftovers_index:]
+                    self.leftovers = None
+                    self.leftovers_index = 0
+                    yield to_yield
+                else:
+                    to_yield = self.leftovers[
+                        self.leftovers_index:(self.leftovers_index + n)]
+                    self.leftovers_index += n
+                    n = 0
+                    yield to_yield
+
+            while n > 0:
+                chunk = next(self.input_iterator)
+                cl = len(chunk)
+                if cl <= n:
+                    n -= cl
+                    yield chunk
+                else:
+                    self.leftovers = chunk
+                    self.leftovers_index = n
+                    yield chunk[:n]
+                    n = 0
+        finally:
+            self._iterator_in_progress = False
+
+
+def tpool_reraise(func, *args, **kwargs):
+    """
+    Hack to work around Eventlet's tpool not catching and reraising Timeouts.
+    """
+    def inner():
+        try:
+            return func(*args, **kwargs)
+        except BaseException as err:
+            return err
+    resp = tpool.execute(inner)
+    if isinstance(resp, BaseException):
+        raise resp
+    return resp
+
+
+def ismount(path):
+    """
+    Test whether a path is a mount point. This will catch any
+    exceptions and translate them into a False return value
+    Use ismount_raw to have the exceptions raised instead.
+    """
+    try:
+        return ismount_raw(path)
+    except OSError:
+        return False
+
+
+def ismount_raw(path):
+    """
+    Test whether a path is a mount point. Whereas ismount will catch
+    any exceptions and just return False, this raw version will not
+    catch exceptions.
+
+    This is code hijacked from C Python 2.6.8, adapted to remove the extra
+    lstat() system call.
+    """
+    try:
+        s1 = os.lstat(path)
+    except os.error as err:
+        if err.errno == errno.ENOENT:
+            # It doesn't exist -- so not a mount point :-)
+            return False
+        raise
+
+    if stat.S_ISLNK(s1.st_mode):
+        # A symlink can never be a mount point
+        return False
+
+    s2 = os.lstat(os.path.join(path, '..'))
+    dev1 = s1.st_dev
+    dev2 = s2.st_dev
+    if dev1 != dev2:
+        # path/.. on a different device as path
+        return True
+
+    ino1 = s1.st_ino
+    ino2 = s2.st_ino
+    if ino1 == ino2:
+        # path/.. is the same i-node as path
+        return True
+
+    return False
+
+
+def close_if_possible(maybe_closable):
+    close_method = getattr(maybe_closable, 'close', None)
+    if callable(close_method):
+        return close_method()
+
+
+@contextmanager
+def closing_if_possible(maybe_closable):
+    """
+    Like contextlib.closing(), but doesn't crash if the object lacks a close()
+    method.
+
+    PEP 333 (WSGI) says: "If the iterable returned by the application has a
+    close() method, the server or gateway must call that method upon
+    completion of the current request[.]" This function makes that easier.
+    """
+    try:
+        yield maybe_closable
+    finally:
+        close_if_possible(maybe_closable)
+
+
+_rfc_token = r'[^()<>@,;:\"/\[\]?={}\x00-\x20\x7f]+'
+_rfc_extension_pattern = re.compile(
+    r'(?:\s*;\s*(' + _rfc_token + r")\s*(?:=\s*(" + _rfc_token +
+    r'|"(?:[^"\\]|\\.)*"))?)')
+
+_content_range_pattern = re.compile(r'^bytes (\d+)-(\d+)/(\d+)$')
+
+
+def parse_content_range(content_range):
+    """
+    Parse a content-range header into (first_byte, last_byte, total_size).
+
+    See RFC 7233 section 4.2 for details on the header format, but it's
+    basically "Content-Range: bytes ${start}-${end}/${total}".
+
+    :param content_range: Content-Range header value to parse,
+        e.g. "bytes 100-1249/49004"
+    :returns: 3-tuple (start, end, total)
+    :raises: ValueError if malformed
+    """
+    found = re.search(_content_range_pattern, content_range)
+    if not found:
+        raise ValueError("malformed Content-Range %r" % (content_range,))
+    return tuple(int(x) for x in found.groups())
+
+
+def parse_content_type(content_type):
+    """
+    Parse a content-type and its parameters into values.
+    RFC 2616 sec 14.17 and 3.7 are pertinent.
+
+    **Examples**::
+
+        'text/plain; charset=UTF-8' -> ('text/plain', [('charset, 'UTF-8')])
+        'text/plain; charset=UTF-8; level=1' ->
+            ('text/plain', [('charset, 'UTF-8'), ('level', '1')])
+
+    :param content_type: content_type to parse
+    :returns: a tuple containing (content type, list of k, v parameter tuples)
+    """
+    parm_list = []
+    if ';' in content_type:
+        content_type, parms = content_type.split(';', 1)
+        parms = ';' + parms
+        for m in _rfc_extension_pattern.findall(parms):
+            key = m[0].strip()
+            value = m[1].strip()
+            parm_list.append((key, value))
+    return content_type, parm_list
+
+
+def extract_swift_bytes(content_type):
+    """
+    Parse a content-type and return a tuple containing:
+        - the content_type string minus any swift_bytes param,
+        -  the swift_bytes value or None if the param was not found
+
+    :param content_type: a content-type string
+    :return: a tuple of (content-type, swift_bytes or None)
+    """
+    content_type, params = parse_content_type(content_type)
+    swift_bytes = None
+    for k, v in params:
+        if k == 'swift_bytes':
+            swift_bytes = v
+        else:
+            content_type += ';%s=%s' % (k, v)
+    return content_type, swift_bytes
+
+
+def override_bytes_from_content_type(listing_dict, logger=None):
+    """
+    Takes a dict from a container listing and overrides the content_type,
+    bytes fields if swift_bytes is set.
+    """
+    listing_dict['content_type'], swift_bytes = extract_swift_bytes(
+        listing_dict['content_type'])
+    if swift_bytes is not None:
+        try:
+            listing_dict['bytes'] = int(swift_bytes)
+        except ValueError:
+            if logger:
+                logger.exception(_("Invalid swift_bytes"))
+
+
+def clean_content_type(value):
+    if ';' in value:
+        left, right = value.rsplit(';', 1)
+        if right.lstrip().startswith('swift_bytes='):
+            return left
+    return value
+
+
+def quote(value, safe='/'):
+    """
+    Patched version of urllib.quote that encodes utf-8 strings before quoting
+    """
+    return _quote(get_valid_utf8_str(value), safe)
+
+
+def get_expirer_container(x_delete_at, expirer_divisor, acc, cont, obj):
+    """
+    Returns a expiring object container name for given X-Delete-At and
+    a/c/o.
+    """
+    shard_int = int(hash_path(acc, cont, obj), 16) % 100
+    return normalize_delete_at_timestamp(
+        int(x_delete_at) / expirer_divisor * expirer_divisor - shard_int)
+
+
+class _MultipartMimeFileLikeObject(object):
+
+    def __init__(self, wsgi_input, boundary, input_buffer, read_chunk_size):
+        self.no_more_data_for_this_file = False
+        self.no_more_files = False
+        self.wsgi_input = wsgi_input
+        self.boundary = boundary
+        self.input_buffer = input_buffer
+        self.read_chunk_size = read_chunk_size
+
+    def read(self, length=None):
+        if not length:
+            length = self.read_chunk_size
+        if self.no_more_data_for_this_file:
+            return b''
+
+        # read enough data to know whether we're going to run
+        # into a boundary in next [length] bytes
+        if len(self.input_buffer) < length + len(self.boundary) + 2:
+            to_read = length + len(self.boundary) + 2
+            while to_read > 0:
+                try:
+                    chunk = self.wsgi_input.read(to_read)
+                except (IOError, ValueError) as e:
+                    raise swift.common.exceptions.ChunkReadError(str(e))
+                to_read -= len(chunk)
+                self.input_buffer += chunk
+                if not chunk:
+                    self.no_more_files = True
+                    break
+
+        boundary_pos = self.input_buffer.find(self.boundary)
+
+        # boundary does not exist in the next (length) bytes
+        if boundary_pos == -1 or boundary_pos > length:
+            ret = self.input_buffer[:length]
+            self.input_buffer = self.input_buffer[length:]
+        # if it does, just return data up to the boundary
+        else:
+            ret, self.input_buffer = self.input_buffer.split(self.boundary, 1)
+            self.no_more_files = self.input_buffer.startswith(b'--')
+            self.no_more_data_for_this_file = True
+            self.input_buffer = self.input_buffer[2:]
+        return ret
+
+    def readline(self):
+        if self.no_more_data_for_this_file:
+            return b''
+        boundary_pos = newline_pos = -1
+        while newline_pos < 0 and boundary_pos < 0:
+            try:
+                chunk = self.wsgi_input.read(self.read_chunk_size)
+            except (IOError, ValueError) as e:
+                raise swift.common.exceptions.ChunkReadError(str(e))
+            self.input_buffer += chunk
+            newline_pos = self.input_buffer.find(b'\r\n')
+            boundary_pos = self.input_buffer.find(self.boundary)
+            if not chunk:
+                self.no_more_files = True
+                break
+        # found a newline
+        if newline_pos >= 0 and \
+                (boundary_pos < 0 or newline_pos < boundary_pos):
+            # Use self.read to ensure any logic there happens...
+            ret = b''
+            to_read = newline_pos + 2
+            while to_read > 0:
+                chunk = self.read(to_read)
+                # Should never happen since we're reading from input_buffer,
+                # but just for completeness...
+                if not chunk:
+                    break
+                to_read -= len(chunk)
+                ret += chunk
+            return ret
+        else:  # no newlines, just return up to next boundary
+            return self.read(len(self.input_buffer))
+
+
+def iter_multipart_mime_documents(wsgi_input, boundary, read_chunk_size=4096):
+    """
+    Given a multi-part-mime-encoded input file object and boundary,
+    yield file-like objects for each part. Note that this does not
+    split each part into headers and body; the caller is responsible
+    for doing that if necessary.
+
+    :param wsgi_input: The file-like object to read from.
+    :param boundary: The mime boundary to separate new file-like
+                     objects on.
+    :returns: A generator of file-like objects for each part.
+    :raises: MimeInvalid if the document is malformed
+    """
+    boundary = '--' + boundary
+    blen = len(boundary) + 2  # \r\n
+    try:
+        got = wsgi_input.readline(blen)
+        while got == '\r\n':
+            got = wsgi_input.readline(blen)
+    except (IOError, ValueError) as e:
+        raise swift.common.exceptions.ChunkReadError(str(e))
+
+    if got.strip() != boundary:
+        raise swift.common.exceptions.MimeInvalid(
+            'invalid starting boundary: wanted %r, got %r', (boundary, got))
+    boundary = '\r\n' + boundary
+    input_buffer = ''
+    done = False
+    while not done:
+        it = _MultipartMimeFileLikeObject(wsgi_input, boundary, input_buffer,
+                                          read_chunk_size)
+        yield it
+        done = it.no_more_files
+        input_buffer = it.input_buffer
+
+
+def parse_mime_headers(doc_file):
+    """
+    Takes a file-like object containing a MIME document and returns a
+    HeaderKeyDict containing the headers. The body of the message is not
+    consumed: the position in doc_file is left at the beginning of the body.
+
+    This function was inspired by the Python standard library's
+    http.client.parse_headers.
+
+    :param doc_file: binary file-like object containing a MIME document
+    :returns: a swift.common.swob.HeaderKeyDict containing the headers
+    """
+    headers = []
+    while True:
+        line = doc_file.readline()
+        done = line in (b'\r\n', b'\n', b'')
+        if six.PY3:
+            try:
+                line = line.decode('utf-8')
+            except UnicodeDecodeError:
+                line = line.decode('latin1')
+        headers.append(line)
+        if done:
+            break
+    if six.PY3:
+        header_string = ''.join(headers)
+    else:
+        header_string = b''.join(headers)
+    headers = email.parser.Parser().parsestr(header_string)
+    return HeaderKeyDict(headers)
+
+
+def mime_to_document_iters(input_file, boundary, read_chunk_size=4096):
+    """
+    Takes a file-like object containing a multipart MIME document and
+    returns an iterator of (headers, body-file) tuples.
+
+    :param input_file: file-like object with the MIME doc in it
+    :param boundary: MIME boundary, sans dashes
+        (e.g. "divider", not "--divider")
+    :param read_chunk_size: size of strings read via input_file.read()
+    """
+    doc_files = iter_multipart_mime_documents(input_file, boundary,
+                                              read_chunk_size)
+    for i, doc_file in enumerate(doc_files):
+        # this consumes the headers and leaves just the body in doc_file
+        headers = parse_mime_headers(doc_file)
+        yield (headers, doc_file)
+
+
+def maybe_multipart_byteranges_to_document_iters(app_iter, content_type):
+    """
+    Takes an iterator that may or may not contain a multipart MIME document
+    as well as content type and returns an iterator of body iterators.
+
+    :param app_iter: iterator that may contain a multipart MIME document
+    :param content_type: content type of the app_iter, used to determine
+                         whether it conains a multipart document and, if
+                         so, what the boundary is between documents
+    """
+    content_type, params_list = parse_content_type(content_type)
+    if content_type != 'multipart/byteranges':
+        yield app_iter
+        return
+
+    body_file = FileLikeIter(app_iter)
+    boundary = dict(params_list)['boundary']
+    for _headers, body in mime_to_document_iters(body_file, boundary):
+        yield (chunk for chunk in iter(lambda: body.read(65536), ''))
+
+
+def document_iters_to_multipart_byteranges(ranges_iter, boundary):
+    """
+    Takes an iterator of range iters and yields a multipart/byteranges MIME
+    document suitable for sending as the body of a multi-range 206 response.
+
+    See document_iters_to_http_response_body for parameter descriptions.
+    """
+
+    divider = "--" + boundary + "\r\n"
+    terminator = "--" + boundary + "--"
+
+    for range_spec in ranges_iter:
+        start_byte = range_spec["start_byte"]
+        end_byte = range_spec["end_byte"]
+        entity_length = range_spec.get("entity_length", "*")
+        content_type = range_spec["content_type"]
+        part_iter = range_spec["part_iter"]
+
+        part_header = ''.join((
+            divider,
+            "Content-Type: ", str(content_type), "\r\n",
+            "Content-Range: ", "bytes %d-%d/%s\r\n" % (
+                start_byte, end_byte, entity_length),
+            "\r\n"
+        ))
+        yield part_header
+
+        for chunk in part_iter:
+            yield chunk
+        yield "\r\n"
+    yield terminator
+
+
+def document_iters_to_http_response_body(ranges_iter, boundary, multipart,
+                                         logger):
+    """
+    Takes an iterator of range iters and turns it into an appropriate
+    HTTP response body, whether that's multipart/byteranges or not.
+
+    This is almost, but not quite, the inverse of
+    request_helpers.http_response_to_document_iters(). This function only
+    yields chunks of the body, not any headers.
+
+    :param ranges_iter: an iterator of dictionaries, one per range.
+        Each dictionary must contain at least the following key:
+        "part_iter": iterator yielding the bytes in the range
+
+        Additionally, if multipart is True, then the following other keys
+        are required:
+
+        "start_byte": index of the first byte in the range
+        "end_byte": index of the last byte in the range
+        "content_type": value for the range's Content-Type header
+
+        Finally, there is one optional key that is used in the
+            multipart/byteranges case:
+
+        "entity_length": length of the requested entity (not necessarily
+            equal to the response length). If omitted, "*" will be used.
+
+        Each part_iter will be exhausted prior to calling next(ranges_iter).
+
+    :param boundary: MIME boundary to use, sans dashes (e.g. "boundary", not
+        "--boundary").
+    :param multipart: True if the response should be multipart/byteranges,
+        False otherwise. This should be True if and only if you have 2 or
+        more ranges.
+    :param logger: a logger
+    """
+    if multipart:
+        return document_iters_to_multipart_byteranges(ranges_iter, boundary)
+    else:
+        try:
+            response_body_iter = next(ranges_iter)['part_iter']
+        except StopIteration:
+            return ''
+
+        # We need to make sure ranges_iter does not get garbage-collected
+        # before response_body_iter is exhausted. The reason is that
+        # ranges_iter has a finally block that calls close_swift_conn, and
+        # so if that finally block fires before we read response_body_iter,
+        # there's nothing there.
+        def string_along(useful_iter, useless_iter_iter, logger):
+            with closing_if_possible(useful_iter):
+                for x in useful_iter:
+                    yield x
+
+            try:
+                next(useless_iter_iter)
+            except StopIteration:
+                pass
+            else:
+                logger.warning(
+                    _("More than one part in a single-part response?"))
+
+        return string_along(response_body_iter, ranges_iter, logger)
+
+
+def multipart_byteranges_to_document_iters(input_file, boundary,
+                                           read_chunk_size=4096):
+    """
+    Takes a file-like object containing a multipart/byteranges MIME document
+    (see RFC 7233, Appendix A) and returns an iterator of (first-byte,
+    last-byte, length, document-headers, body-file) 5-tuples.
+
+    :param input_file: file-like object with the MIME doc in it
+    :param boundary: MIME boundary, sans dashes
+        (e.g. "divider", not "--divider")
+    :param read_chunk_size: size of strings read via input_file.read()
+    """
+    for headers, body in mime_to_document_iters(input_file, boundary,
+                                                read_chunk_size):
+        first_byte, last_byte, length = parse_content_range(
+            headers.get('content-range'))
+        yield (first_byte, last_byte, length, headers.items(), body)
+
+
+#: Regular expression to match form attributes.
+ATTRIBUTES_RE = re.compile(r'(\w+)=(".*?"|[^";]+)(; ?|$)')
+
+
+def parse_content_disposition(header):
+    """
+    Given the value of a header like:
+    Content-Disposition: form-data; name="somefile"; filename="test.html"
+
+    Return data like
+    ("form-data", {"name": "somefile", "filename": "test.html"})
+
+    :param header: Value of a header (the part after the ': ').
+    :returns: (value name, dict) of the attribute data parsed (see above).
+    """
+    attributes = {}
+    attrs = ''
+    if ';' in header:
+        header, attrs = [x.strip() for x in header.split(';', 1)]
+    m = True
+    while m:
+        m = ATTRIBUTES_RE.match(attrs)
+        if m:
+            attrs = attrs[len(m.group(0)):]
+            attributes[m.group(1)] = m.group(2).strip('"')
+    return header, attributes
+
+
+class sockaddr_alg(ctypes.Structure):
+    _fields_ = [("salg_family", ctypes.c_ushort),
+                ("salg_type", ctypes.c_ubyte * 14),
+                ("salg_feat", ctypes.c_uint),
+                ("salg_mask", ctypes.c_uint),
+                ("salg_name", ctypes.c_ubyte * 64)]
+
+
+_bound_md5_sockfd = None
+
+
+def get_md5_socket():
+    """
+    Get an MD5 socket file descriptor. One can MD5 data with it by writing it
+    to the socket with os.write, then os.read the 16 bytes of the checksum out
+    later.
+
+    NOTE: It is the caller's responsibility to ensure that os.close() is
+    called on the returned file descriptor. This is a bare file descriptor,
+    not a Python object. It doesn't close itself.
+    """
+
+    # Linux's AF_ALG sockets work like this:
+    #
+    # First, initialize a socket with socket() and bind(). This tells the
+    # socket what algorithm to use, as well as setting up any necessary bits
+    # like crypto keys. Of course, MD5 doesn't need any keys, so it's just the
+    # algorithm name.
+    #
+    # Second, to hash some data, get a second socket by calling accept() on
+    # the first socket. Write data to the socket, then when finished, read the
+    # checksum from the socket and close it. This lets you checksum multiple
+    # things without repeating all the setup code each time.
+    #
+    # Since we only need to bind() one socket, we do that here and save it for
+    # future re-use. That way, we only use one file descriptor to get an MD5
+    # socket instead of two, and we also get to save some syscalls.
+
+    global _bound_md5_sockfd
+    global _libc_socket
+    global _libc_bind
+    global _libc_accept
+
+    if _libc_accept is None:
+        _libc_accept = load_libc_function('accept', fail_if_missing=True)
+    if _libc_socket is None:
+        _libc_socket = load_libc_function('socket', fail_if_missing=True)
+    if _libc_bind is None:
+        _libc_bind = load_libc_function('bind', fail_if_missing=True)
+
+    # Do this at first call rather than at import time so that we don't use a
+    # file descriptor on systems that aren't using any MD5 sockets.
+    if _bound_md5_sockfd is None:
+        sockaddr_setup = sockaddr_alg(
+            AF_ALG,
+            (ord('h'), ord('a'), ord('s'), ord('h'), 0),
+            0, 0,
+            (ord('m'), ord('d'), ord('5'), 0))
+        hash_sockfd = _libc_socket(ctypes.c_int(AF_ALG),
+                                   ctypes.c_int(socket.SOCK_SEQPACKET),
+                                   ctypes.c_int(0))
+        if hash_sockfd < 0:
+            raise IOError(ctypes.get_errno(),
+                          "Failed to initialize MD5 socket")
+
+        bind_result = _libc_bind(ctypes.c_int(hash_sockfd),
+                                 ctypes.pointer(sockaddr_setup),
+                                 ctypes.c_int(ctypes.sizeof(sockaddr_alg)))
+        if bind_result < 0:
+            os.close(hash_sockfd)
+            raise IOError(ctypes.get_errno(), "Failed to bind MD5 socket")
+
+        _bound_md5_sockfd = hash_sockfd
+
+    md5_sockfd = _libc_accept(ctypes.c_int(_bound_md5_sockfd), None, 0)
+    if md5_sockfd < 0:
+        raise IOError(ctypes.get_errno(), "Failed to accept MD5 socket")
+
+    return md5_sockfd
+
+
+def modify_priority(conf, logger):
+    """
+    Modify priority by nice and ionice.
+    """
+
+    global _libc_setpriority
+    if _libc_setpriority is None:
+        _libc_setpriority = load_libc_function('setpriority',
+                                               errcheck=True)
+
+    def _setpriority(nice_priority):
+        """
+        setpriority for this pid
+
+        :param nice_priority: valid values are -19 to 20
+        """
+        try:
+            _libc_setpriority(PRIO_PROCESS, os.getpid(),
+                              int(nice_priority))
+        except (ValueError, OSError):
+            print(_("WARNING: Unable to modify scheduling priority of process."
+                    " Keeping unchanged! Check logs for more info. "))
+            logger.exception('Unable to modify nice priority')
+        else:
+            logger.debug('set nice priority to %s' % nice_priority)
+
+    nice_priority = conf.get('nice_priority')
+    if nice_priority is not None:
+        _setpriority(nice_priority)
+
+    global _posix_syscall
+    if _posix_syscall is None:
+        _posix_syscall = load_libc_function('syscall', errcheck=True)
+
+    def _ioprio_set(io_class, io_priority):
+        """
+        ioprio_set for this process
+
+        :param io_class: the I/O class component, can be
+                         IOPRIO_CLASS_RT, IOPRIO_CLASS_BE,
+                         or IOPRIO_CLASS_IDLE
+        :param io_priority: priority value in the I/O class
+        """
+        try:
+            io_class = IO_CLASS_ENUM[io_class]
+            io_priority = int(io_priority)
+            _posix_syscall(NR_ioprio_set(),
+                           IOPRIO_WHO_PROCESS,
+                           os.getpid(),
+                           IOPRIO_PRIO_VALUE(io_class, io_priority))
+        except (KeyError, ValueError, OSError):
+            print(_("WARNING: Unable to modify I/O scheduling class "
+                    "and priority of process. Keeping unchanged! "
+                    "Check logs for more info."))
+            logger.exception("Unable to modify ionice priority")
+        else:
+            logger.debug('set ionice class %s priority %s',
+                         io_class, io_priority)
+
+    io_class = conf.get("ionice_class")
+    if io_class is None:
+        return
+    io_priority = conf.get("ionice_priority", 0)
+    _ioprio_set(io_class, io_priority)
+
+
+def o_tmpfile_supported():
+    """
+    Returns True if O_TMPFILE flag is supported.
+
+    O_TMPFILE was introduced in Linux 3.11 but it also requires support from
+    underlying filesystem being used. Some common filesystems and linux
+    versions in which those filesystems added support for O_TMPFILE:
+    xfs (3.15)
+    ext4 (3.11)
+    btrfs (3.16)
+    """
+    return all([linkat.available,
+                platform.system() == 'Linux',
+                LooseVersion(platform.release()) >= LooseVersion('3.16')])
+
+
+def safe_json_loads(value):
+    if value:
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError):
+            pass
+    return None

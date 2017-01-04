@@ -1,4 +1,4 @@
-# Copyright (c) 2011 OpenStack, LLC.
+# Copyright (c) 2011 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,7 +31,14 @@ The format of the form is::
       <input type="submit" />
     </form>
 
-The <swift-url> is the URL to the Swift desination, such as::
+Optionally, if you want the uploaded files to be temporary you can set
+x-delete-at or x-delete-after attributes by adding one of these as a
+form input::
+
+    <input type="hidden" name="x_delete_at" value="<unix-timestamp>" />
+    <input type="hidden" name="x_delete_after" value="<seconds>" />
+
+The <swift-url> is the URL of the Swift destination, such as::
 
     https://swift-cluster.example.com/v1/AUTH_account/container/object_prefix
 
@@ -49,11 +56,12 @@ different users' uploads, such as::
 Note the form method must be POST and the enctype must be set as
 "multipart/form-data".
 
-The redirect attribute is the URL to redirect the browser to after
-the upload completes. The URL will have status and message query
-parameters added to it, indicating the HTTP status code for the
-upload (2xx is success) and a possible message for further
-information if there was an error (such as "max_file_size exceeded").
+The redirect attribute is the URL to redirect the browser to after the upload
+completes. This is an optional parameter. If you are uploading the form via an
+XMLHttpRequest the redirect should not be included. The URL will have status
+and message query parameters added to it, indicating the HTTP status code for
+the upload (2xx is success) and a possible message for further information if
+there was an error (such as "max_file_size exceeded").
 
 The max_file_size attribute must be included and indicates the
 largest single file upload that can be done, in bytes.
@@ -73,7 +81,7 @@ sample code for computing the signature::
     from hashlib import sha1
     from time import time
     path = '/v1/account/container/object_prefix'
-    redirect = 'https://myserver.com/some-page'
+    redirect = 'https://srv.com/some-page'  # set to '' if redirect not in form
     max_file_size = 104857600
     max_file_count = 10
     expires = int(time() + 600)
@@ -82,10 +90,13 @@ sample code for computing the signature::
         max_file_size, max_file_count, expires)
     signature = hmac.new(key, hmac_body, sha1).hexdigest()
 
-The key is the value of the X-Account-Meta-Temp-URL-Key header on the
-account.
+The key is the value of either the account (X-Account-Meta-Temp-URL-Key,
+X-Account-Meta-Temp-Url-Key-2) or the container
+(X-Container-Meta-Temp-URL-Key, X-Container-Meta-Temp-Url-Key-2) TempURL keys.
 
 Be certain to use the full path, from the /v1/ onward.
+Note that x_delete_at and x_delete_after are not used in signature generation
+as they are both optional attributes.
 
 The command line tool ``swift-form-signature`` may be used (mostly
 just when testing) to compute expires and signature.
@@ -102,16 +113,18 @@ the file are simply ignored).
 __all__ = ['FormPost', 'filter_factory', 'READ_CHUNK_SIZE', 'MAX_VALUE_LENGTH']
 
 import hmac
-import re
-import rfc822
 from hashlib import sha1
-from StringIO import StringIO
-from time import gmtime, strftime, time
-from urllib import quote, unquote
+from time import time
 
-from swift.common.utils import get_logger, streq_const_time
+from six.moves.urllib.parse import quote
+from swift.common.exceptions import MimeInvalid
+from swift.common.middleware.tempurl import get_tempurl_keys_from_metadata
+from swift.common.utils import streq_const_time, register_swift_info, \
+    parse_content_disposition, parse_mime_headers, \
+    iter_multipart_mime_documents
 from swift.common.wsgi import make_pre_authed_env
-from swift.common.http import HTTP_BAD_REQUEST
+from swift.common.swob import HTTPUnauthorized
+from swift.proxy.controllers.base import get_account_info, get_container_info
 
 
 #: The size of data to read from the form at any given time.
@@ -121,131 +134,13 @@ READ_CHUNK_SIZE = 4096
 #: truncated.
 MAX_VALUE_LENGTH = 4096
 
-#: Regular expression to match form attributes.
-ATTRIBUTES_RE = re.compile(r'(\w+)=(".*?"|[^";]+)(; ?|$)')
-
 
 class FormInvalid(Exception):
     pass
 
 
-def _parse_attrs(header):
-    """
-    Given the value of a header like:
-    Content-Disposition: form-data; name="somefile"; filename="test.html"
-
-    Return data like
-    ("form-data", {"name": "somefile", "filename": "test.html"})
-
-    :param header: Value of a header (the part after the ': ').
-    :returns: (value name, dict) of the attribute data parsed (see above).
-    """
-    attributes = {}
-    attrs = ''
-    if '; ' in header:
-        header, attrs = header.split('; ', 1)
-    m = True
-    while m:
-        m = ATTRIBUTES_RE.match(attrs)
-        if m:
-            attrs = attrs[len(m.group(0)):]
-            attributes[m.group(1)] = m.group(2).strip('"')
-    return header, attributes
-
-
-class _IterRequestsFileLikeObject(object):
-
-    def __init__(self, wsgi_input, boundary, input_buffer):
-        self.no_more_data_for_this_file = False
-        self.no_more_files = False
-        self.wsgi_input = wsgi_input
-        self.boundary = boundary
-        self.input_buffer = input_buffer
-
-    def read(self, length=None):
-        if not length:
-            length = READ_CHUNK_SIZE
-        if self.no_more_data_for_this_file:
-            return ''
-
-        # read enough data to know whether we're going to run
-        # into a boundary in next [length] bytes
-        if len(self.input_buffer) < length + len(self.boundary) + 2:
-            to_read = length + len(self.boundary) + 2
-            while to_read > 0:
-                chunk = self.wsgi_input.read(to_read)
-                to_read -= len(chunk)
-                self.input_buffer += chunk
-                if not chunk:
-                    self.no_more_files = True
-                    break
-
-        boundary_pos = self.input_buffer.find(self.boundary)
-
-        # boundary does not exist in the next (length) bytes
-        if boundary_pos == -1 or boundary_pos > length:
-            ret = self.input_buffer[:length]
-            self.input_buffer = self.input_buffer[length:]
-        # if it does, just return data up to the boundary
-        else:
-            ret, self.input_buffer = self.input_buffer.split(self.boundary, 1)
-            self.no_more_files = self.input_buffer.startswith('--')
-            self.no_more_data_for_this_file = True
-            self.input_buffer = self.input_buffer[2:]
-        return ret
-
-    def readline(self):
-        if self.no_more_data_for_this_file:
-            return ''
-        boundary_pos = newline_pos = -1
-        while newline_pos < 0 and boundary_pos < 0:
-            chunk = self.wsgi_input.read(READ_CHUNK_SIZE)
-            self.input_buffer += chunk
-            newline_pos = self.input_buffer.find('\r\n')
-            boundary_pos = self.input_buffer.find(self.boundary)
-            if not chunk:
-                self.no_more_files = True
-                break
-        # found a newline
-        if newline_pos >= 0 and \
-                (boundary_pos < 0 or newline_pos < boundary_pos):
-            # Use self.read to ensure any logic there happens...
-            ret = ''
-            to_read = newline_pos + 2
-            while to_read > 0:
-                chunk = self.read(to_read)
-                # Should never happen since we're reading from input_buffer,
-                # but just for completeness...
-                if not chunk:
-                    break
-                to_read -= len(chunk)
-                ret += chunk
-            return ret
-        else:  # no newlines, just return up to next boundary
-            return self.read(len(self.input_buffer))
-
-
-def _iter_requests(wsgi_input, boundary):
-    """
-    Given a multi-part mime encoded input file object and boundary,
-    yield file-like objects for each part.
-
-    :param wsgi_input: The file-like object to read from.
-    :param boundary: The mime boundary to separate new file-like
-                     objects on.
-    :returns: A generator of file-like objects for each part.
-    """
-    boundary = '--' + boundary
-    if wsgi_input.readline().strip() != boundary:
-        raise FormInvalid('invalid starting boundary')
-    boundary = '\r\n' + boundary
-    input_buffer = ''
-    done = False
-    while not done:
-        it = _IterRequestsFileLikeObject(wsgi_input, boundary, input_buffer)
-        yield it
-        done = it.no_more_files
-        input_buffer = it.input_buffer
+class FormUnauthorized(Exception):
+    pass
 
 
 class _CappedFileLikeObject(object):
@@ -263,11 +158,13 @@ class _CappedFileLikeObject(object):
         self.fp = fp
         self.max_file_size = max_file_size
         self.amount_read = 0
+        self.file_size_exceeded = False
 
     def read(self, size=None):
         ret = self.fp.read(size)
         self.amount_read += len(ret)
         if self.amount_read > self.max_file_size:
+            self.file_size_exceeded = True
             raise EOFError('max_file_size exceeded')
         return ret
 
@@ -275,6 +172,7 @@ class _CappedFileLikeObject(object):
         ret = self.fp.readline()
         self.amount_read += len(ret)
         if self.amount_read > self.max_file_size:
+            self.file_size_exceeded = True
             raise EOFError('max_file_size exceeded')
         return ret
 
@@ -284,6 +182,9 @@ class FormPost(object):
     FormPost Middleware
 
     See above for a full description.
+
+    The proxy logs created for any subrequests made will have swift.source set
+    to "FP".
 
     :param app: The next WSGI filter or app in the paste.deploy
                 chain.
@@ -295,10 +196,6 @@ class FormPost(object):
         self.app = app
         #: The filter configuration dict.
         self.conf = conf
-        #: The logger to use with this middleware.
-        self.logger = get_logger(conf, log_route='formpost')
-        #: The HTTP user agent to use with subrequests.
-        self.agent = '%(orig)s FormPost'
 
     def __call__(self, env, start_response):
         """
@@ -311,22 +208,34 @@ class FormPost(object):
         if env['REQUEST_METHOD'] == 'POST':
             try:
                 content_type, attrs = \
-                    _parse_attrs(env.get('CONTENT_TYPE') or '')
+                    parse_content_disposition(env.get('CONTENT_TYPE') or '')
                 if content_type == 'multipart/form-data' and \
                         'boundary' in attrs:
+                    http_user_agent = "%s FormPost" % (
+                        env.get('HTTP_USER_AGENT', ''))
+                    env['HTTP_USER_AGENT'] = http_user_agent.strip()
                     status, headers, body = self._translate_form(
                         env, attrs['boundary'])
-                    self._log_request(env, int(status.split(' ', 1)[0]))
                     start_response(status, headers)
-                    return body
-            except (FormInvalid, EOFError), err:
-                self._log_request(env, HTTP_BAD_REQUEST)
+                    return [body]
+            except MimeInvalid:
+                body = 'FormPost: invalid starting boundary'
+                start_response(
+                    '400 Bad Request',
+                    (('Content-Type', 'text/plain'),
+                     ('Content-Length', str(len(body)))))
+                return [body]
+            except (FormInvalid, EOFError) as err:
                 body = 'FormPost: %s' % err
                 start_response(
                     '400 Bad Request',
                     (('Content-Type', 'text/plain'),
                      ('Content-Length', str(len(body)))))
                 return [body]
+            except FormUnauthorized as err:
+                message = 'FormPost: %s' % str(err).title()
+                return HTTPUnauthorized(body=message)(
+                    env, start_response)
         return self.app(env, start_response)
 
     def _translate_form(self, env, boundary):
@@ -338,14 +247,16 @@ class FormPost(object):
         :param boundary: The MIME type boundary to look for.
         :returns: status_line, headers_list, body
         """
-        key = self._get_key(env)
+        keys = self._get_keys(env)
         status = message = ''
         attributes = {}
+        subheaders = []
         file_count = 0
-        for fp in _iter_requests(env['wsgi.input'], boundary):
-            hdrs = rfc822.Message(fp, 0)
-            disp, attrs = \
-                _parse_attrs(hdrs.getheader('Content-Disposition', ''))
+        for fp in iter_multipart_mime_documents(
+                env['wsgi.input'], boundary, read_chunk_size=READ_CHUNK_SIZE):
+            hdrs = parse_mime_headers(fp)
+            disp, attrs = parse_content_disposition(
+                hdrs.get('Content-Disposition', ''))
             if disp == 'form-data' and attrs.get('filename'):
                 file_count += 1
                 try:
@@ -359,9 +270,9 @@ class FormPost(object):
                 if 'content-type' not in attributes and 'content-type' in hdrs:
                     attributes['content-type'] = \
                         hdrs['Content-Type'] or 'application/octet-stream'
-                status, message = self._perform_subrequest(env, attributes, fp,
-                                                           key)
-                if status[:1] != '2':
+                status, subheaders, message = \
+                    self._perform_subrequest(env, attributes, fp, keys)
+                if not status.startswith('2'):
                     break
             else:
                 data = ''
@@ -379,24 +290,31 @@ class FormPost(object):
         if not status:
             status = '400 Bad Request'
             message = 'no files to process'
-        if not attributes.get('redirect'):
+
+        headers = [(k, v) for k, v in subheaders
+                   if k.lower().startswith('access-control')]
+
+        redirect = attributes.get('redirect')
+        if not redirect:
             body = status
             if message:
                 body = status + '\r\nFormPost: ' + message.title()
-            headers = [('Content-Type', 'text/plain'),
-                       ('Content-Length', len(body))]
+            headers.extend([('Content-Type', 'text/plain'),
+                            ('Content-Length', len(body))])
             return status, headers, body
         status = status.split(' ', 1)[0]
-        body = '<html><body><p><a href="%s?status=%s&message=%s">Click to ' \
-               'continue...</a></p></body></html>' % \
-               (attributes['redirect'], quote(status), quote(message))
-        headers = [
-            ('Location', '%s?status=%s&message=%s' % (
-                attributes['redirect'], quote(status), quote(message))),
-            ('Content-Length', str(len(body)))]
+        if '?' in redirect:
+            redirect += '&'
+        else:
+            redirect += '?'
+        redirect += 'status=%s&message=%s' % (quote(status), quote(message))
+        body = '<html><body><p><a href="%s">' \
+               'Click to continue...</a></p></body></html>' % redirect
+        headers.extend(
+            [('Location', redirect), ('Content-Length', str(len(body)))])
         return '303 See Other', headers, body
 
-    def _perform_subrequest(self, orig_env, attributes, fp, key):
+    def _perform_subrequest(self, orig_env, attributes, fp, keys):
         """
         Performs the subrequest and returns the response.
 
@@ -404,22 +322,38 @@ class FormPost(object):
                          to form a new env for the subrequest.
         :param attributes: dict of the attributes of the form so far.
         :param fp: The file-like object containing the request body.
-        :param key: The account key to validate the signature with.
-        :returns: (status_line, message)
+        :param keys: The account keys to validate the signature with.
+        :returns: (status_line, headers_list, message)
         """
-        if not key:
-            return '401 Unauthorized', 'invalid signature'
+        if not keys:
+            raise FormUnauthorized('invalid signature')
         try:
             max_file_size = int(attributes.get('max_file_size') or 0)
         except ValueError:
             raise FormInvalid('max_file_size not an integer')
-        subenv = make_pre_authed_env(orig_env, 'PUT', agent=self.agent)
+        subenv = make_pre_authed_env(orig_env, 'PUT', agent=None,
+                                     swift_source='FP')
+        if 'QUERY_STRING' in subenv:
+            del subenv['QUERY_STRING']
         subenv['HTTP_TRANSFER_ENCODING'] = 'chunked'
         subenv['wsgi.input'] = _CappedFileLikeObject(fp, max_file_size)
-        if subenv['PATH_INFO'][-1] != '/' and \
+        if not subenv['PATH_INFO'].endswith('/') and \
                 subenv['PATH_INFO'].count('/') < 4:
             subenv['PATH_INFO'] += '/'
         subenv['PATH_INFO'] += attributes['filename'] or 'filename'
+        if 'x_delete_at' in attributes:
+            try:
+                subenv['HTTP_X_DELETE_AT'] = int(attributes['x_delete_at'])
+            except ValueError:
+                raise FormInvalid('x_delete_at not an integer: '
+                                  'Unix timestamp required.')
+        if 'x_delete_after' in attributes:
+            try:
+                subenv['HTTP_X_DELETE_AFTER'] = int(
+                    attributes['x_delete_after'])
+            except ValueError:
+                raise FormInvalid('x_delete_after not an integer: '
+                                  'Number of seconds required.')
         if 'content-type' in attributes:
             subenv['CONTENT_TYPE'] = \
                 attributes['content-type'] or 'application/octet-stream'
@@ -427,7 +361,7 @@ class FormPost(object):
             del subenv['CONTENT_TYPE']
         try:
             if int(attributes.get('expires') or 0) < time():
-                return '401 Unauthorized', 'form expired'
+                raise FormUnauthorized('form expired')
         except ValueError:
             raise FormInvalid('expired not an integer')
         hmac_body = '%s\n%s\n%s\n%s\n%s' % (
@@ -436,103 +370,69 @@ class FormPost(object):
             attributes.get('max_file_size') or '0',
             attributes.get('max_file_count') or '0',
             attributes.get('expires') or '0')
-        sig = hmac.new(key, hmac_body, sha1).hexdigest()
-        if not streq_const_time(sig, (attributes.get('signature') or
+
+        has_valid_sig = False
+        for key in keys:
+            sig = hmac.new(key, hmac_body, sha1).hexdigest()
+            if streq_const_time(sig, (attributes.get('signature') or
                                       'invalid')):
-            return '401 Unauthorized', 'invalid signature'
+                has_valid_sig = True
+        if not has_valid_sig:
+            raise FormUnauthorized('invalid signature')
+
         substatus = [None]
+        subheaders = [None]
+
+        wsgi_input = subenv['wsgi.input']
 
         def _start_response(status, headers, exc_info=None):
+            if wsgi_input.file_size_exceeded:
+                raise EOFError("max_file_size exceeded")
+
             substatus[0] = status
+            subheaders[0] = headers
 
         i = iter(self.app(subenv, _start_response))
         try:
-            i.next()
+            next(i)
         except StopIteration:
             pass
-        return substatus[0], ''
+        return substatus[0], subheaders[0], ''
 
-    def _get_key(self, env):
+    def _get_keys(self, env):
         """
-        Returns the X-Account-Meta-Temp-URL-Key header value for the
-        account, or None if none is set.
+        Returns the X-[Account|Container]-Meta-Temp-URL-Key[-2] header values
+        for the account or container, or an empty list if none are set.
+
+        Returns 0-4 elements depending on how many keys are set in the
+        account's or container's metadata.
+
+        Also validate that the request
+        path indicates a valid container; if not, no keys will be returned.
 
         :param env: The WSGI environment for the request.
-        :returns: X-Account-Meta-Temp-URL-Key str value, or None.
+        :returns: list of tempurl keys
         """
         parts = env['PATH_INFO'].split('/', 4)
         if len(parts) < 4 or parts[0] or parts[1] != 'v1' or not parts[2] or \
                 not parts[3]:
-            return None
-        account = parts[2]
-        key = None
-        memcache = env.get('swift.cache')
-        if memcache:
-            key = memcache.get('temp-url-key/%s' % account)
-        if not key:
-            newenv = make_pre_authed_env(env, 'HEAD', '/v1/' + account,
-                                         self.agent)
-            newenv['CONTENT_LENGTH'] = '0'
-            newenv['wsgi.input'] = StringIO('')
-            key = [None]
+            return []
 
-            def _start_response(status, response_headers, exc_info=None):
-                for h, v in response_headers:
-                    if h.lower() == 'x-account-meta-temp-url-key':
-                        key[0] = v
+        account_info = get_account_info(env, self.app, swift_source='FP')
+        account_keys = get_tempurl_keys_from_metadata(account_info['meta'])
 
-            i = iter(self.app(newenv, _start_response))
-            try:
-                i.next()
-            except StopIteration:
-                pass
-            key = key[0]
-            if key and memcache:
-                memcache.set('temp-url-key/%s' % account, key, timeout=60)
-        return key
+        container_info = get_container_info(env, self.app, swift_source='FP')
+        container_keys = get_tempurl_keys_from_metadata(
+            container_info.get('meta', []))
 
-    def _log_request(self, env, response_status_int):
-        """
-        Used when a request might not be logged by the underlying
-        WSGI application, but we'd still like to record what
-        happened. An early 401 Unauthorized is a good example of
-        this.
-
-        :param env: The WSGI environment for the request.
-        :param response_status_int: The HTTP status we'll be replying
-                                    to the request with.
-        """
-        the_request = quote(unquote(env.get('PATH_INFO') or '/'))
-        if env.get('QUERY_STRING'):
-            the_request = the_request + '?' + env['QUERY_STRING']
-        client = env.get('HTTP_X_CLUSTER_CLIENT_IP')
-        if not client and 'HTTP_X_FORWARDED_FOR' in env:
-            # remote host for other lbs
-            client = env['HTTP_X_FORWARDED_FOR'].split(',')[0].strip()
-        if not client:
-            client = env.get('REMOTE_ADDR')
-        self.logger.info(' '.join(quote(str(x)) for x in (
-            client or '-',
-            env.get('REMOTE_ADDR') or '-',
-            strftime('%d/%b/%Y/%H/%M/%S', gmtime()),
-            env.get('REQUEST_METHOD') or 'GET',
-            the_request,
-            env.get('SERVER_PROTOCOL') or '1.0',
-            response_status_int,
-            env.get('HTTP_REFERER') or '-',
-            (env.get('HTTP_USER_AGENT') or '-') + ' FormPOST',
-            env.get('HTTP_X_AUTH_TOKEN') or '-',
-            '-',
-            '-',
-            '-',
-            env.get('swift.trans_id') or '-',
-            '-',
-            '-',
-        )))
+        return account_keys + container_keys
 
 
 def filter_factory(global_conf, **local_conf):
-    """ Returns the WSGI filter for use with paste.deploy. """
+    """Returns the WSGI filter for use with paste.deploy."""
     conf = global_conf.copy()
     conf.update(local_conf)
+
+    register_swift_info('formpost')
+
     return lambda app: FormPost(app, conf)

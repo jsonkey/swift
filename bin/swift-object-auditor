@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# Copyright (c) 2010-2012 OpenStack, LLC.
+# Copyright (c) 2010-2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,5 +23,7 @@ if __name__ == '__main__':
     parser = OptionParser("%prog CONFIG [options]")
     parser.add_option('-z', '--zero_byte_fps',
                       help='Audit only zero byte files at specified files/sec')
+    parser.add_option('-d', '--devices',
+                      help='Audit only given devices. Comma-separated list')
     conf_file, options = parse_options(parser=parser, once=True)
     run_daemon(ObjectAuditor, conf_file, **options)

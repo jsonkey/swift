@@ -1,4 +1,4 @@
-# Copyright (c) 2010-2012 OpenStack, LLC.
+# Copyright (c) 2010-2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,9 +30,10 @@ Browsers can convert a host header to lowercase, so check that reseller
 prefix on the account is the correct case. This is done by comparing the
 items in the reseller_prefixes config option to the found prefix. If they
 match except for case, the item from reseller_prefixes will be used
-instead of the found reseller prefix. The reseller_prefixes list is
-exclusive. If defined, any request with an account prefix not in that list
-will be ignored by this middleware. reseller_prefixes defaults to 'AUTH'.
+instead of the found reseller prefix. When none match, the default reseller
+prefix is used. When no default reseller prefix is configured, any request with
+an account prefix not in that list will be ignored by this middleware.
+reseller_prefixes defaults to 'AUTH'.
 
 Note that this middleware requires that container names and account names
 (except as described above) must be DNS-compatible. This means that the
@@ -50,6 +51,7 @@ sync destinations.
 """
 
 from swift.common.swob import Request, HTTPBadRequest
+from swift.common.utils import list_from_csv, register_swift_info
 
 
 class DomainRemapMiddleware(object):
@@ -66,19 +68,22 @@ class DomainRemapMiddleware(object):
     def __init__(self, app, conf):
         self.app = app
         self.storage_domain = conf.get('storage_domain', 'example.com')
-        if self.storage_domain and self.storage_domain[0] != '.':
+        if self.storage_domain and not self.storage_domain.startswith('.'):
             self.storage_domain = '.' + self.storage_domain
         self.path_root = conf.get('path_root', 'v1').strip('/')
         prefixes = conf.get('reseller_prefixes', 'AUTH')
-        self.reseller_prefixes = [x.strip() for x in prefixes.split(',')
-                                  if x.strip()]
+        self.reseller_prefixes = list_from_csv(prefixes)
         self.reseller_prefixes_lower = [x.lower()
                                         for x in self.reseller_prefixes]
+        self.default_reseller_prefix = conf.get('default_reseller_prefix')
 
     def __call__(self, env, start_response):
         if not self.storage_domain:
             return self.app(env, start_response)
-        given_domain = env['HTTP_HOST']
+        if 'HTTP_HOST' in env:
+            given_domain = env['HTTP_HOST']
+        else:
+            given_domain = env['SERVER_NAME']
         port = ''
         if ':' in given_domain:
             given_domain, port = given_domain.rsplit(':', 1)
@@ -95,18 +100,25 @@ class DomainRemapMiddleware(object):
                                       body='Bad domain in host header',
                                       content_type='text/plain')
                 return resp(env, start_response)
-            if '_' not in account and '-' in account:
-                account = account.replace('-', '_', 1)
-            account_reseller_prefix = account.split('_', 1)[0].lower()
-            if account_reseller_prefix not in self.reseller_prefixes_lower:
-                # account prefix is not in config list. bail.
-                return self.app(env, start_response)
-            prefix_index = self.reseller_prefixes_lower.index(
-                                                    account_reseller_prefix)
-            real_prefix = self.reseller_prefixes[prefix_index]
-            if not account.startswith(real_prefix):
-                account_suffix = account[len(real_prefix):]
-                account = real_prefix + account_suffix
+            if len(self.reseller_prefixes) > 0:
+                if '_' not in account and '-' in account:
+                    account = account.replace('-', '_', 1)
+                account_reseller_prefix = account.split('_', 1)[0].lower()
+
+                if account_reseller_prefix in self.reseller_prefixes_lower:
+                    prefix_index = self.reseller_prefixes_lower.index(
+                        account_reseller_prefix)
+                    real_prefix = self.reseller_prefixes[prefix_index]
+                    if not account.startswith(real_prefix):
+                        account_suffix = account[len(real_prefix):]
+                        account = real_prefix + account_suffix
+                elif self.default_reseller_prefix:
+                    # account prefix is not in config list. Add default one.
+                    account = "%s_%s" % (self.default_reseller_prefix, account)
+                else:
+                    # account prefix is not in config list. bail.
+                    return self.app(env, start_response)
+
             path = env['PATH_INFO'].strip('/')
             new_path_parts = ['', self.path_root, account]
             if container:
@@ -123,6 +135,10 @@ class DomainRemapMiddleware(object):
 def filter_factory(global_conf, **local_conf):
     conf = global_conf.copy()
     conf.update(local_conf)
+
+    register_swift_info(
+        'domain_remap',
+        default_reseller_prefix=conf.get('default_reseller_prefix'))
 
     def domain_filter(app):
         return DomainRemapMiddleware(app, conf)

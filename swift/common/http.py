@@ -1,4 +1,4 @@
-# Copyright (c) 2010-2012 OpenStack, LLC.
+# Copyright (c) 2010-2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@ def is_informational(status):
     :param status: http status code
     :returns: True if status is successful, else False
     """
-    return 100 <= status and status <= 199
+    return 100 <= status <= 199
 
 
 def is_success(status):
@@ -31,7 +31,7 @@ def is_success(status):
     :param status: http status code
     :returns: True if status is successful, else False
     """
-    return 200 <= status and status <= 299
+    return 200 <= status <= 299
 
 
 def is_redirection(status):
@@ -41,7 +41,7 @@ def is_redirection(status):
     :param status: http status code
     :returns: True if status is redirection, else False
     """
-    return 300 <= status and status <= 399
+    return 300 <= status <= 399
 
 
 def is_client_error(status):
@@ -51,7 +51,7 @@ def is_client_error(status):
     :param status: http status code
     :returns: True if status is client error, else False
     """
-    return 400 <= status and status <= 499
+    return 400 <= status <= 499
 
 
 def is_server_error(status):
@@ -61,13 +61,13 @@ def is_server_error(status):
     :param status: http status code
     :returns: True if status is server error, else False
     """
-    return 500 <= status and status <= 599
+    return 500 <= status <= 599
 
 
 # List of HTTP status codes
 
 ###############################################################################
-## 1xx Informational
+# 1xx Informational
 ###############################################################################
 
 HTTP_CONTINUE = 100
@@ -77,7 +77,7 @@ HTTP_CHECKPOINT = 103
 HTTP_REQUEST_URI_TOO_LONG = 122
 
 ###############################################################################
-## 2xx Success
+# 2xx Success
 ###############################################################################
 
 HTTP_OK = 200
@@ -91,7 +91,7 @@ HTTP_MULTI_STATUS = 207  # WebDAV
 HTTP_IM_USED = 226
 
 ###############################################################################
-## 3xx Redirection
+# 3xx Redirection
 ###############################################################################
 
 HTTP_MULTIPLE_CHOICES = 300
@@ -105,7 +105,7 @@ HTTP_TEMPORARY_REDIRECT = 307
 HTTP_RESUME_INCOMPLETE = 308
 
 ###############################################################################
-## 4xx Client Error
+# 4xx Client Error
 ###############################################################################
 
 HTTP_BAD_REQUEST = 400
@@ -141,7 +141,7 @@ HTTP_BLOCKED_BY_WINDOWS_PARENTAL_CONTROLS = 450
 HTTP_CLIENT_CLOSED_REQUEST = 499
 
 ###############################################################################
-## 5xx Server Error
+# 5xx Server Error
 ###############################################################################
 
 HTTP_INTERNAL_SERVER_ERROR = 500

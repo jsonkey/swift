@@ -2,6 +2,33 @@
 Administrator's Guide
 =====================
 
+-------------------------
+Defining Storage Policies
+-------------------------
+
+Defining your Storage Policies is very easy to do with Swift.  It is important
+that the administrator understand the concepts behind Storage Policies
+before actually creating and using them in order to get the most benefit out
+of the feature and, more importantly, to avoid having to make unnecessary changes
+once a set of policies have been deployed to a cluster.
+
+It is highly recommended that the reader fully read and comprehend
+:doc:`overview_policies` before proceeding with administration of
+policies.  Plan carefully and it is suggested that experimentation be
+done first on a non-production cluster to be certain that the desired
+configuration meets the needs of the users.  See :ref:`upgrade-policy`
+before planning the upgrade of your existing deployment.
+
+Following is a high level view of the very few steps it takes to configure
+policies once you have decided what you want to do:
+
+  #. Define your policies in ``/etc/swift/swift.conf``
+  #. Create the corresponding object rings
+  #. Communicate the names of the Storage Policies to cluster users
+
+For a specific example that takes you through these steps, please see
+:doc:`policies_saio`
+
 ------------------
 Managing the Rings
 ------------------
@@ -32,15 +59,15 @@ For more information see :doc:`overview_ring`.
 Removing a device from the ring::
 
     swift-ring-builder <builder-file> remove <ip_address>/<device_name>
-    
+
 Removing a server from the ring::
 
     swift-ring-builder <builder-file> remove <ip_address>
-    
+
 Adding devices to the ring:
 
 See :ref:`ring-preparing`
-    
+
 See what devices for a server are in the ring::
 
     swift-ring-builder <builder-file> search <ip_address>
@@ -49,9 +76,79 @@ Once you are done with all changes to the ring, the changes need to be
 "committed"::
 
     swift-ring-builder <builder-file> rebalance
-    
+
 Once the new rings are built, they should be pushed out to all the servers
 in the cluster.
+
+Optionally, if invoked as 'swift-ring-builder-safe' the directory containing
+the specified builder file will be locked (via a .lock file in the parent
+directory). This provides a basic safe guard against multiple instances
+of the swift-ring-builder (or other utilities that observe this lock) from
+attempting to write to or read the builder/ring files while operations are in
+progress. This can be useful in environments where ring management has been
+automated but the operator still needs to interact with the rings manually.
+
+If the ring builder is not producing the balances that you are
+expecting, you can gain visibility into what it's doing with the
+``--debug`` flag.::
+
+    swift-ring-builder <builder-file> rebalance --debug
+
+This produces a great deal of output that is mostly useful if you are
+either (a) attempting to fix the ring builder, or (b) filing a bug
+against the ring builder.
+
+You may notice in the rebalance output a 'dispersion' number. What this
+number means is explained in :ref:`ring_dispersion` but in essence
+is the percentage of partitions in the ring that have too many replicas
+within a particular failure domain. You can ask 'swift-ring-builder' what
+the dispersion is with::
+
+  swift-ring-builder <builder-file> dispersion
+
+This will give you the percentage again, if you want a detailed view of
+the dispersion simply add a ``--verbose``::
+
+  swift-ring-builder <builder-file> dispersion --verbose
+
+This will not only display the percentage but will also display a dispersion
+table that lists partition dispersion by tier. You can use this table to figure
+out were you need to add capacity or to help tune an :ref:`ring_overload` value.
+
+Now let's take an example with 1 region, 3 zones and 4 devices. Each device has
+the same weight, and the ``dispersion --verbose`` might show the following::
+
+  Dispersion is 50.000000, Balance is 0.000000, Overload is 0.00%
+  Required overload is 33.333333%
+  Worst tier is 50.000000 (r1z3)
+  --------------------------------------------------------------------------
+  Tier                           Parts      %    Max     0     1     2     3
+  --------------------------------------------------------------------------
+  r1                               256   0.00      3     0     0     0   256
+  r1z1                             192   0.00      1    64   192     0     0
+  r1z1-127.0.0.1                   192   0.00      1    64   192     0     0
+  r1z1-127.0.0.1/sda               192   0.00      1    64   192     0     0
+  r1z2                             192   0.00      1    64   192     0     0
+  r1z2-127.0.0.2                   192   0.00      1    64   192     0     0
+  r1z2-127.0.0.2/sda               192   0.00      1    64   192     0     0
+  r1z3                             256  50.00      1     0   128   128     0
+  r1z3-127.0.0.3                   256  50.00      1     0   128   128     0
+  r1z3-127.0.0.3/sda               192   0.00      1    64   192     0     0
+  r1z3-127.0.0.3/sdb               192   0.00      1    64   192     0     0
+
+
+The first line reports that there are 256 partitions with 3 copies in region 1;
+and this is an expected output in this case (single region with 3 replicas) as
+reported by the "Max" value.
+
+However, there is some imbalance in the cluster, more precisely in zone 3. The
+"Max" reports a maximum of 1 copy in this zone; however 50.00% of the partitions
+are storing 2 replicas in this zone (which is somewhat expected, because there
+are more disks in this zone).
+
+You can now either add more capacity to the other zones, decrease the total
+weight in zone 3 or set the overload to a value `greater than` 33.333333% -
+only as much overload as needed will be used.
 
 -----------------------
 Scripting Ring Creation
@@ -65,18 +162,19 @@ You can create scripts to create the account and container rings and rebalance. 
     cd /etc/swift
     rm -f account.builder account.ring.gz backups/account.builder backups/account.ring.gz
     swift-ring-builder account.builder create 18 3 1
-    swift-ring-builder account.builder add z1-<account-server-1>:6002/sdb1 1
-    swift-ring-builder account.builder add z2-<account-server-2>:6002/sdb1 1
+    swift-ring-builder account.builder add r1z1-<account-server-1>:6202/sdb1 1
+    swift-ring-builder account.builder add r1z2-<account-server-2>:6202/sdb1 1
     swift-ring-builder account.builder rebalance
 
    You need to replace the values of <account-server-1>,
    <account-server-2>, etc. with the IP addresses of the account
    servers used in your setup. You can have as many account servers as
    you need. All account servers are assumed to be listening on port
-   6002, and have a storage device called "sdb1" (this is a directory
+   6202, and have a storage device called "sdb1" (this is a directory
    name created under /drives when we setup the account server). The
    "z1", "z2", etc. designate zones, and you can choose whether you
-   put devices in the same or different zones.
+   put devices in the same or different zones. The "r1" designates
+   the region, with different regions specified as "r1", "r2", etc.
 
 2. Make the script file executable and run it to create the account ring file::
 
@@ -109,16 +207,31 @@ until it has been resolved.  If the drive is going to be replaced immediately,
 then it is just best to replace the drive, format it, remount it, and let
 replication fill it up.
 
+After the drive is unmounted, make sure the mount point is owned by root
+(root:root 755). This ensures that rsync will not try to replicate into the
+root drive once the failed drive is unmounted.
+
 If the drive can't be replaced immediately, then it is best to leave it
-unmounted, and remove the drive from the ring. This will allow all the
+unmounted, and set the device weight to 0. This will allow all the
 replicas that were on that drive to be replicated elsewhere until the drive
-is replaced.  Once the drive is replaced, it can be re-added to the ring.
+is replaced. Once the drive is replaced, the device weight can be increased
+again. Setting the device weight to 0 instead of removing the drive from the
+ring gives Swift the chance to replicate data from the failing disk too (in case
+it is still possible to read some of the data).
+
+Setting the device weight to 0 (or removing a failed drive from the ring) has
+another benefit: all partitions that were stored on the failed drive are
+distributed over the remaining disks in the cluster, and each disk only needs to
+store a few new partitions. This is much faster compared to replicating all
+partitions to a single, new disk. It decreases the time to recover from a
+degraded number of replicas significantly, and becomes more and more important
+with bigger disks.
 
 -----------------------
 Handling Server Failure
 -----------------------
 
-If a server is having hardware issues, it is a good idea to make sure the 
+If a server is having hardware issues, it is a good idea to make sure the
 swift services are not running.  This will allow Swift to work around the
 failure while you troubleshoot.
 
@@ -141,31 +254,135 @@ Detecting Failed Drives
 
 It has been our experience that when a drive is about to fail, error messages
 will spew into `/var/log/kern.log`.  There is a script called
-`swift-drive-audit` that can be run via cron to watch for bad drives.  If 
+`swift-drive-audit` that can be run via cron to watch for bad drives.  If
 errors are detected, it will unmount the bad drive, so that Swift can
 work around it.  The script takes a configuration file with the following
 settings:
 
 [drive-audit]
 
-==================  ==========  ===========================================
-Option              Default     Description
-------------------  ----------  -------------------------------------------
-log_facility        LOG_LOCAL0  Syslog log facility
-log_level           INFO        Log level
-device_dir          /srv/node   Directory devices are mounted under
-minutes             60          Number of minutes to look back in
-                                `/var/log/kern.log`
-error_limit         1           Number of errors to find before a device
-                                is unmounted
-==================  ==========  ===========================================
+==================  ==============  ===========================================
+Option              Default         Description
+------------------  --------------  -------------------------------------------
+user                swift           Drop privileges to this user for non-root
+                                    tasks
+log_facility        LOG_LOCAL0      Syslog log facility
+log_level           INFO            Log level
+device_dir          /srv/node       Directory devices are mounted under
+minutes             60              Number of minutes to look back in
+                                    `/var/log/kern.log`
+error_limit         1               Number of errors to find before a device
+                                    is unmounted
+log_file_pattern    /var/log/kern*  Location of the log file with globbing
+                                    pattern to check against device errors
+regex_pattern_X     (see below)     Regular expression patterns to be used to
+                                    locate device blocks with errors in the
+                                    log file
+==================  ==============  ===========================================
 
-This script has only been tested on Ubuntu 10.04, so if you are using a
-different distro or OS, some care should be taken before using in production.
+The default regex pattern used to locate device blocks with errors are
+`\berror\b.*\b(sd[a-z]{1,2}\d?)\b` and `\b(sd[a-z]{1,2}\d?)\b.*\berror\b`.
+One is able to overwrite the default above by providing new expressions
+using the format `regex_pattern_X = regex_expression`, where `X` is a number.
 
---------------
-Cluster Health
---------------
+This script has been tested on Ubuntu 10.04 and Ubuntu 12.04, so if you are
+using a different distro or OS, some care should be taken before using in production.
+
+------------------------------
+Preventing Disk Full Scenarios
+------------------------------
+
+Prevent disk full scenarios by ensuring that the ``proxy-server`` blocks PUT
+requests and rsync prevents replication to the specific drives.
+
+You can prevent `proxy-server` PUT requests to low space disks by ensuring
+``fallocate_reserve`` is set in the ``object-server.conf``. By default,
+``fallocate_reserve`` is set to 1%. This blocks PUT requests that leave the
+free disk space below 1% of the disk.
+
+In order to prevent rsync replication to specific drives, firstly
+setup ``rsync_module`` per disk in your ``object-replicator``.
+Set this in ``object-server.conf``:
+
+.. code::
+
+    [object-replicator]
+    rsync_module = {replication_ip}::object_{device}
+
+Set the individual drives in ``rsync.conf``. For example:
+
+.. code::
+
+    [object_sda]
+    max connections = 4
+    lock file = /var/lock/object_sda.lock
+
+    [object_sdb]
+    max connections = 4
+    lock file = /var/lock/object_sdb.lock
+
+Finally, monitor the disk space of each disk and adjust the rsync
+``max connections`` per drive to ``-1``. We recommend utilising your existing
+monitoring solution to achieve this. The following is an example script:
+
+.. code-block:: python
+
+    #!/usr/bin/env python
+    import os
+    import errno
+
+    RESERVE = 500 * 2 ** 20  # 500 MiB
+
+    DEVICES = '/srv/node1'
+
+    path_template = '/etc/rsync.d/disable_%s.conf'
+    config_template = '''
+    [object_%s]
+    max connections = -1
+    '''
+
+    def disable_rsync(device):
+        with open(path_template % device, 'w') as f:
+            f.write(config_template.lstrip() % device)
+
+
+    def enable_rsync(device):
+        try:
+            os.unlink(path_template % device)
+        except OSError as e:
+            # ignore file does not exist
+            if e.errno != errno.ENOENT:
+                raise
+
+
+    for device in os.listdir(DEVICES):
+        path = os.path.join(DEVICES, device)
+        st = os.statvfs(path)
+        free = st.f_bavail * st.f_frsize
+        if free < RESERVE:
+            disable_rsync(device)
+        else:
+            enable_rsync(device)
+
+For the above script to work, ensure ``/etc/rsync.d/`` conf files are
+included, by specifying ``&include`` in your ``rsync.conf`` file:
+
+.. code::
+
+    &include /etc/rsync.d
+
+Use this in conjunction with a cron job to periodically run the script, for example:
+
+.. code::
+
+    # /etc/cron.d/devicecheck
+    * * * * * root /some/path/to/disable_rsync.py
+
+.. _dispersion_report:
+
+-----------------
+Dispersion Report
+-----------------
 
 There is a swift-dispersion-report tool for measuring overall cluster health.
 This is accomplished by checking if a set of deliberately distributed
@@ -200,10 +417,12 @@ configuration file, /etc/swift/dispersion.conf. Example conf file::
     auth_url = http://localhost:8080/auth/v1.0
     auth_user = test:tester
     auth_key = testing
+    endpoint_type = internalURL
 
 There are also options for the conf file for specifying the dispersion coverage
 (defaults to 1%), retries, concurrency, etc. though usually the defaults are
-fine.
+fine. If you want to use keystone v3 for authentication there are options like
+auth_version, user_domain_name, project_domain_name and project_name.
 
 Once the configuration is in place, run `swift-dispersion-populate` to populate
 the containers and objects throughout the cluster.
@@ -216,7 +435,7 @@ the cluster. Here is an example of a cluster in perfect health::
     Queried 2621 containers for dispersion reporting, 19s, 0 retries
     100.00% of container copies found (7863 of 7863)
     Sample represents 1.00% of the container partition space
-    
+
     Queried 2619 objects for dispersion reporting, 7s, 0 retries
     100.00% of object copies found (7857 of 7857)
     Sample represents 1.00% of the object partition space
@@ -232,7 +451,7 @@ that has::
     Queried 2621 containers for dispersion reporting, 8s, 0 retries
     100.00% of container copies found (7863 of 7863)
     Sample represents 1.00% of the container partition space
-    
+
     Queried 2619 objects for dispersion reporting, 7s, 0 retries
     There were 1763 partitions missing one copy.
     77.56% of object copies found (6094 of 7857)
@@ -254,11 +473,166 @@ place and then rerun the dispersion report::
     100.00% of object copies found (7857 of 7857)
     Sample represents 1.00% of the object partition space
 
-Alternatively, the dispersion report can also be output in json format. This 
+You can also run the report for only containers or objects::
+
+    $ swift-dispersion-report --container-only
+    Queried 2621 containers for dispersion reporting, 17s, 0 retries
+    100.00% of container copies found (7863 of 7863)
+    Sample represents 1.00% of the container partition space
+
+    $ swift-dispersion-report --object-only
+    Queried 2619 objects for dispersion reporting, 7s, 0 retries
+    100.00% of object copies found (7857 of 7857)
+    Sample represents 1.00% of the object partition space
+
+Alternatively, the dispersion report can also be output in JSON format. This
 allows it to be more easily consumed by third party utilities::
 
     $ swift-dispersion-report -j
     {"object": {"retries:": 0, "missing_two": 0, "copies_found": 7863, "missing_one": 0, "copies_expected": 7863, "pct_found": 100.0, "overlapping": 0, "missing_all": 0}, "container": {"retries:": 0, "missing_two": 0, "copies_found": 12534, "missing_one": 0, "copies_expected": 12534, "pct_found": 100.0, "overlapping": 15, "missing_all": 0}}
+
+Note that you may select which storage policy to use by setting the option
+'--policy-name silver' or '-P silver' (silver is the example policy name here).
+If no policy is specified, the default will be used per the swift.conf file.
+When you specify a policy the containers created also include the policy index,
+thus even when running a container_only report, you will need to specify the
+policy not using the default.
+
+-----------------------------------------------
+Geographically Distributed Swift Considerations
+-----------------------------------------------
+
+Swift provides two features that may be used to distribute replicas of objects
+across multiple geographically distributed data-centers: with
+:doc:`overview_global_cluster` object replicas may be dispersed across devices
+from different data-centers by using `regions` in ring device descriptors; with
+:doc:`overview_container_sync` objects may be copied between independent Swift
+clusters in each data-center. The operation and configuration of each are
+described in their respective documentation. The following points should be
+considered when selecting the feature that is most appropriate for a particular
+use case:
+
+  #. Global Clusters allows the distribution of object replicas across
+     data-centers to be controlled by the cluster operator on per-policy basis,
+     since the distribution is determined by the assignment of devices from
+     each data-center in each policy's ring file. With Container Sync the end
+     user controls the distribution of objects across clusters on a
+     per-container basis.
+
+  #. Global Clusters requires an operator to coordinate ring deployments across
+     multiple data-centers. Container Sync allows for independent management of
+     separate Swift clusters in each data-center, and for existing Swift
+     clusters to be used as peers in Container Sync relationships without
+     deploying new policies/rings.
+
+  #. Global Clusters seamlessly supports features that may rely on
+     cross-container operations such as large objects and versioned writes.
+     Container Sync requires the end user to ensure that all required
+     containers are sync'd for these features to work in all data-centers.
+
+  #. Global Clusters makes objects available for GET or HEAD requests in both
+     data-centers even if a replica of the object has not yet been
+     asynchronously migrated between data-centers, by forwarding requests
+     between data-centers. Container Sync is unable to serve requests for an
+     object in a particular data-center until the asynchronous sync process has
+     copied the object to that data-center.
+
+  #. Global Clusters may require less storage capacity than Container Sync to
+     achieve equivalent durability of objects in each data-center. Global
+     Clusters can restore replicas that are lost or corrupted in one
+     data-center using replicas from other data-centers. Container Sync
+     requires each data-center to independently manage the durability of
+     objects, which may result in each data-center storing more replicas than
+     with Global Clusters.
+
+  #. Global Clusters execute all account/container metadata updates
+     synchronously to account/container replicas in all data-centers, which may
+     incur delays when making updates across WANs. Container Sync only copies
+     objects between data-centers and all Swift internal traffic is
+     confined to each data-center.
+
+  #. Global Clusters does not yet guarantee the availability of objects stored
+     in Erasure Coded policies when one data-center is offline. With Container
+     Sync the availability of objects in each data-center is independent of the
+     state of other data-centers once objects have been synced. Container Sync
+     also allows objects to be stored using different policy types in different
+     data-centers.
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Checking handoff partition distribution
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+You can check if handoff partitions are piling up on a server by
+comparing the expected number of partitions with the actual number on
+your disks. First get the number of partitions that are currently
+assigned to a server using the ``dispersion`` command from
+``swift-ring-builder``::
+
+    swift-ring-builder sample.builder dispersion --verbose
+    Dispersion is 0.000000, Balance is 0.000000, Overload is 0.00%
+    Required overload is 0.000000%
+    --------------------------------------------------------------------------
+    Tier                           Parts      %    Max     0     1     2     3
+    --------------------------------------------------------------------------
+    r1                              8192   0.00      2     0     0  8192     0
+    r1z1                            4096   0.00      1  4096  4096     0     0
+    r1z1-172.16.10.1                4096   0.00      1  4096  4096     0     0
+    r1z1-172.16.10.1/sda1           4096   0.00      1  4096  4096     0     0
+    r1z2                            4096   0.00      1  4096  4096     0     0
+    r1z2-172.16.10.2                4096   0.00      1  4096  4096     0     0
+    r1z2-172.16.10.2/sda1           4096   0.00      1  4096  4096     0     0
+    r1z3                            4096   0.00      1  4096  4096     0     0
+    r1z3-172.16.10.3                4096   0.00      1  4096  4096     0     0
+    r1z3-172.16.10.3/sda1           4096   0.00      1  4096  4096     0     0
+    r1z4                            4096   0.00      1  4096  4096     0     0
+    r1z4-172.16.20.4                4096   0.00      1  4096  4096     0     0
+    r1z4-172.16.20.4/sda1           4096   0.00      1  4096  4096     0     0
+    r2                              8192   0.00      2     0  8192     0     0
+    r2z1                            4096   0.00      1  4096  4096     0     0
+    r2z1-172.16.20.1                4096   0.00      1  4096  4096     0     0
+    r2z1-172.16.20.1/sda1           4096   0.00      1  4096  4096     0     0
+    r2z2                            4096   0.00      1  4096  4096     0     0
+    r2z2-172.16.20.2                4096   0.00      1  4096  4096     0     0
+    r2z2-172.16.20.2/sda1           4096   0.00      1  4096  4096     0     0
+
+As you can see from the output, each server should store 4096 partitions, and
+each region should store 8192 partitions. This example used a partition power
+of 13 and 3 replicas.
+
+With write_affinity enabled it is expected to have a higher number of
+partitions on disk compared to the value reported by the
+swift-ring-builder dispersion command. The number of additional (handoff)
+partitions in region r1 depends on your cluster size, the amount
+of incoming data as well as the replication speed.
+
+Let's use the example from above with 6 nodes in 2 regions, and write_affinity
+configured to write to region r1 first. `swift-ring-builder` reported that
+each node should store 4096 partitions::
+
+ Expected partitions for region r2:                                      8192
+ Handoffs stored across 4 nodes in region r1:                 8192 / 4 = 2048
+ Maximum number of partitions on each server in region r1: 2048 + 4096 = 6144
+
+Worst case is that handoff partitions in region 1 are populated with new
+object replicas faster than replication is able to move them to region 2.
+In that case you will see ~ 6144 partitions per
+server in region r1. Your actual number should be lower and
+between 4096 and 6144 partitions (preferably on the lower side).
+
+Now count the number of object partitions on a given server in region 1,
+for example on 172.16.10.1.  Note that the pathnames might be
+different; `/srv/node/` is the default mount location, and `objects`
+applies only to storage policy 0 (storage policy 1 would use
+`objects-1` and so on)::
+
+    find -L /srv/node/ -maxdepth 3 -type d -wholename "*objects/*" | wc -l
+
+If this number is always on the upper end of the expected partition
+number range (4096 to 6144) or increasing you should check your
+replication speed and maybe even disable write_affinity.
+Please refer to the next section how to collect metrics from Swift, and
+especially :ref:`swift-recon -r <recon-replication>` how to check replication
+stats.
 
 
 --------------------------------
@@ -307,8 +681,9 @@ periodically on your object servers::
 
     */5 * * * * swift /usr/bin/swift-recon-cron /etc/swift/object-server.conf
 
-Once the recon middleware is enabled a GET request for "/recon/<metric>" to
-the server will return a json formatted response::
+Once the recon middleware is enabled, a GET request for
+"/recon/<metric>" to the backend object server will return a
+JSON-formatted response::
 
     fhines@ubuntu:~$ curl -i http://localhost:6030/recon/async
     HTTP/1.1 200 OK
@@ -317,6 +692,10 @@ the server will return a json formatted response::
     Date: Tue, 18 Oct 2011 21:03:01 GMT
 
     {"async_pending": 0}
+
+
+Note that the default port for the object server is 6200, except on a
+Swift All-In-One installation, which uses 6010, 6020, 6030, and 6040.
 
 The following metrics and telemetry are currently exposed:
 
@@ -328,23 +707,32 @@ Request URI                 Description
 /recon/mounted              returns *ALL* currently mounted filesystems
 /recon/unmounted            returns all unmounted drives if mount_check = True
 /recon/diskusage            returns disk utilization for storage devices
+/recon/driveaudit           returns # of drive audit errors
 /recon/ringmd5              returns object/container/account ring md5sums
+/recon/swiftconfmd5         returns swift.conf md5sum
 /recon/quarantined          returns # of quarantined objects/accounts/containers
 /recon/sockstat             returns consumable info from /proc/net/sockstat|6
 /recon/devices              returns list of devices and devices dir i.e. /srv/node
 /recon/async                returns count of async pending
-/recon/replication          returns object replication times (for backward compatability)
+/recon/replication          returns object replication info (for backward compatibility)
 /recon/replication/<type>   returns replication info for given type (account, container, object)
 /recon/auditor/<type>       returns auditor stats on last reported scan for given type (account, container, object)
 /recon/updater/<type>       returns last updater sweep times for given type (container, object)
+/recon/expirer/object       returns time elapsed and number of objects deleted during last object expirer sweep
+/recon/version              returns Swift version
+/recon/time                 returns node time
 =========================   ========================================================================================
+
+Note that 'object_replication_last' and 'object_replication_time' in object
+replication info are considered to be transitional and will be removed in
+the subsequent releases. Use 'replication_last' and 'replication_time' instead.
 
 This information can also be queried via the swift-recon command line utility::
 
     fhines@ubuntu:~$ swift-recon -h
-    Usage: 
+    Usage:
             usage: swift-recon <server_type> [-v] [--suppress] [-a] [-r] [-u] [-d]
-            [-l] [--md5] [--auditor] [--updater] [--expirer] [--sockstat]
+            [-l] [-T] [--md5] [--auditor] [--updater] [--expirer] [--sockstat]
 
             <server_type>   account|container|object
             Defaults to object server.
@@ -367,11 +755,16 @@ This information can also be queried via the swift-recon command line utility::
       -q, --quarantined     Get cluster quarantine stats
       --md5                 Get md5sum of servers ring and compare to local copy
       --sockstat            Get cluster socket usage stats
-      --all                 Perform all checks. Equal to -arudlq --md5 --sockstat
+      -T, --time            Check time synchronization
+      --all                 Perform all checks. Equal to
+                            -arudlqT --md5 --sockstat --auditor --updater
+                            --expirer --driveaudit --validate-servers
       -z ZONE, --zone=ZONE  Only query servers in specified zone
       -t SECONDS, --timeout=SECONDS
                             Time to wait for a response from a server
       --swiftdir=SWIFTDIR   Default = /etc/swift
+
+.. _recon-replication:
 
 For example, to obtain container replication info from all hosts in zone "3"::
 
@@ -395,11 +788,16 @@ configuration entries (see the sample configuration files)::
 
     log_statsd_host = localhost
     log_statsd_port = 8125
-    log_statsd_default_sample_rate = 1
+    log_statsd_default_sample_rate = 1.0
+    log_statsd_sample_rate_factor = 1.0
     log_statsd_metric_prefix =                [empty-string]
 
 If `log_statsd_host` is not set, this feature is disabled.  The default values
-for the other settings are given above.
+for the other settings are given above.  The `log_statsd_host` can be a
+hostname, an IPv4 address, or an IPv6 address (not surrounded with brackets, as
+this is unnecessary since the port is specified separately).  If a hostname
+resolves to an IPv4 address, an IPv4 socket will be used to send StatsD UDP
+packets, even if the hostname would also resolve to an IPv6 address.
 
 .. _StatsD: http://codeascraft.etsy.com/2011/02/15/measure-anything-measure-everything/
 .. _Graphite: http://graphite.wikidot.com/
@@ -410,9 +808,24 @@ probability of sending a sample for any given event or timing measurement.
 This sample rate is sent with each sample to StatsD and used to
 multiply the value.  For example, with a sample rate of 0.5, StatsD will
 multiply that counter's value by 2 when flushing the metric to an upstream
-monitoring system (Graphite_, Ganglia_, etc.).  To get the best data, start
-with the default `log_statsd_default_sample_rate` value of 1 and only lower
-it as needed.
+monitoring system (Graphite_, Ganglia_, etc.).
+
+Some relatively high-frequency metrics have a default sample rate less than
+one.  If you want to override the default sample rate for all metrics whose
+default sample rate is not specified in the Swift source, you may set
+`log_statsd_default_sample_rate` to a value less than one.  This is NOT
+recommended (see next paragraph).  A better way to reduce StatsD load is to
+adjust `log_statsd_sample_rate_factor` to a value less than one.  The
+`log_statsd_sample_rate_factor` is multiplied to any sample rate (either the
+global default or one specified by the actual metric logging call in the Swift
+source) prior to handling.  In other words, this one tunable can lower the
+frequency of all StatsD logging by a proportional amount.
+
+To get the best data, start with the default `log_statsd_default_sample_rate`
+and `log_statsd_sample_rate_factor` values of 1 and only lower
+`log_statsd_sample_rate_factor` if needed.  The
+`log_statsd_default_sample_rate` should not be used and remains for backward
+compatibility only.
 
 The metric prefix will be prepended to every metric sent to the StatsD server
 For example, with::
@@ -425,17 +838,17 @@ servers when sending statistics to a central StatsD server.  If you run a local
 StatsD server per node, you could configure a per-node metrics prefix there and
 leave `log_statsd_metric_prefix` blank.
 
-Note that metrics reported to StatsD are counters or timing data (which
-StatsD usually expands out to min, max, avg, count, and 90th percentile
-per timing metric).  Some important "gauge" metrics will still need to
-be collected using another method.  For example, the
-`object-server.async_pendings` StatsD metric counts the generation of
-async_pendings in real-time, but will not tell you the current number
-of async_pending container updates on disk at any point in time.
+Note that metrics reported to StatsD are counters or timing data (which are
+sent in units of milliseconds).  StatsD usually expands timing data out to min,
+max, avg, count, and 90th percentile per timing metric, but the details of
+this behavior will depend on the configuration of your StatsD server.  Some
+important "gauge" metrics may still need to be collected using another method.
+For example, the `object-server.async_pendings` StatsD metric counts the generation
+of async_pendings in real-time, but will not tell you the current number of
+async_pending container updates on disk at any point in time.
 
 Note also that the set of metrics collected, their names, and their semantics
-are not locked down and will change over time.  StatsD logging is currently in
-a "beta" stage and will continue to evolve.
+are not locked down and will change over time.
 
 Metrics for `account-auditor`:
 
@@ -457,7 +870,7 @@ Metric Name                                     Description
 `account-reaper.errors`                         Count of devices failing the mount check.
 `account-reaper.timing`                         Timing data for each reap_account() call.
 `account-reaper.return_codes.X`                 Count of HTTP return codes from various operations
-                                                (eg. object listing, container deletion, etc.). The
+                                                (e.g. object listing, container deletion, etc.). The
                                                 value for X is the first digit of the return code
                                                 (2 for 201, 4 for 404, etc.).
 `account-reaper.containers_failures`            Count of failures to delete a container.
@@ -626,7 +1039,7 @@ Metric Name                      Description
 `container-sync.deletes`         Count of container database rows sync'ed by
                                  deletion.
 `container-sync.deletes.timing`  Timing data for each container database row
-                                 sychronization via deletion.
+                                 synchronization via deletion.
 `container-sync.puts`            Count of container database rows sync'ed by PUTing.
 `container-sync.puts.timing`     Timing data for each container database row
                                  synchronization via PUTing.
@@ -674,6 +1087,31 @@ Metric Name               Description
                           including ones resulting in an error.
 ========================  ====================================================
 
+Metrics for `object-reconstructor`:
+
+======================================================  ======================================================
+Metric Name                                             Description
+------------------------------------------------------  ------------------------------------------------------
+`object-reconstructor.partition.delete.count.<device>`  A count of partitions on <device> which were
+                                                        reconstructed and synced to another node because they
+                                                        didn't belong on this node. This metric is tracked
+                                                        per-device to allow for "quiescence detection" for
+                                                        object reconstruction activity on each device.
+`object-reconstructor.partition.delete.timing`          Timing data for partitions reconstructed and synced to
+                                                        another node because they didn't belong on this node.
+                                                        This metric is not tracked per device.
+`object-reconstructor.partition.update.count.<device>`  A count of partitions on <device> which were
+                                                        reconstructed and synced to another node, but also
+                                                        belong on this node. As with delete.count, this metric
+                                                        is tracked per-device.
+`object-reconstructor.partition.update.timing`          Timing data for partitions reconstructed which also
+                                                        belong on this node. This metric is not tracked
+                                                        per-device.
+`object-reconstructor.suffix.hashes`                    Count of suffix directories whose hash (of filenames)
+                                                        was recalculated.
+`object-reconstructor.suffix.syncs`                     Count of suffix directories reconstructed with ssync.
+======================================================  ======================================================
+
 Metrics for `object-replicator`:
 
 ===================================================  ====================================================
@@ -718,6 +1156,9 @@ Metric Name                              Description
 `object-server.PUT.timeouts`             Count of object PUTs which exceeded max_upload_time.
 `object-server.PUT.timing`               Timing data for each PUT request not resulting in an
                                          error.
+`object-server.PUT.<device>.timing`      Timing data per kB transferred (ms/kB) for each
+                                         non-zero-byte PUT request on each device.
+                                         Monitoring problematic devices, higher is bad.
 `object-server.GET.errors.timing`        Timing data for GET request errors: bad request,
                                          not mounted, header timestamps before the epoch,
                                          precondition failed.
@@ -799,21 +1240,42 @@ proxy-server controller responsible for the request: "account", "container",
 middleware.  The `<verb>` portion will be one of "GET", "HEAD", "POST", "PUT",
 "DELETE", "COPY", "OPTIONS", or "BAD_METHOD".  The list of valid HTTP methods
 is configurable via the `log_statsd_valid_http_methods` config variable and
-the default setting yields the above behavior.
+the default setting yields the above behavior):
 
 .. _Swift Origin Server: https://github.com/dpgoetz/sos
 
-============================================  ====================================================
-Metric Name                                   Description
---------------------------------------------  ----------------------------------------------------
-`proxy-server.<type>.<verb>.<status>.timing`  Timing data for requests.  The <status> portion is
-                                              the numeric HTTP status code for the request (eg.
-                                              "200" or "404")
-`proxy-server.<type>.<verb>.<status>.xfer`    The count of the sum of bytes transferred in (from
-                                              clients) and out (to clients) for requests.  The
-                                              <type>, <verb>, and <status> portions of the metric
-                                              are just like the timing metric.
-============================================  ====================================================
+====================================================  ============================================
+Metric Name                                           Description
+----------------------------------------------------  --------------------------------------------
+`proxy-server.<type>.<verb>.<status>.timing`          Timing data for requests, start to finish.
+                                                      The <status> portion is the numeric HTTP
+                                                      status code for the request (e.g.  "200" or
+                                                      "404").
+`proxy-server.<type>.GET.<status>.first-byte.timing`  Timing data up to completion of sending the
+                                                      response headers (only for GET requests).
+                                                      <status> and <type> are as for the main
+                                                      timing metric.
+`proxy-server.<type>.<verb>.<status>.xfer`            This counter metric is the sum of bytes
+                                                      transferred in (from clients) and out (to
+                                                      clients) for requests.  The <type>, <verb>,
+                                                      and <status> portions of the metric are just
+                                                      like the main timing metric.
+====================================================  ============================================
+
+The `proxy-logging` middleware also groups these metrics by policy.  The
+`<policy-index>` portion represents a policy index):
+
+==========================================================================  =====================================
+Metric Name                                                                 Description
+--------------------------------------------------------------------------  -------------------------------------
+`proxy-server.object.policy.<policy-index>.<verb>.<status>.timing`          Timing data for requests, aggregated
+                                                                            by policy index.
+`proxy-server.object.policy.<policy-index>.GET.<status>.first-byte.timing`  Timing data up to completion of
+                                                                            sending the response headers,
+                                                                            aggregated by policy index.
+`proxy-server.object.policy.<policy-index>.<verb>.<status>.xfer`            Sum of bytes transferred in and out,
+                                                                            aggregated by policy index.
+==========================================================================  =====================================
 
 Metrics for `tempauth` middleware (in the table, `<reseller_prefix>` represents
 the actual configured reseller_prefix or "`NONE`" if the reseller_prefix is the
@@ -846,6 +1308,14 @@ If you are looking at an object on the server and need more info,
 `swift-object-info` will display the account, container, replica locations
 and metadata of the object.
 
+If you are looking at a container on the server and need more info,
+`swift-container-info` will display all the information like the account,
+container, replica locations and metadata of the container.
+
+If you are looking at an account on the server and need more info,
+`swift-account-info` will display the account, replica locations
+and metadata of the account.
+
 If you want to audit the data for an account, `swift-account-audit` can be
 used to crawl the account, checking that all containers and objects can be
 found.
@@ -855,7 +1325,7 @@ Managing Services
 -----------------
 
 Swift services are generally managed with `swift-init`. the general usage is
-``swift-init <service> <command>``, where service is the swift service to 
+``swift-init <service> <command>``, where service is the swift service to
 manage (for example object, container, account, proxy) and command is one of:
 
 ==========  ===============================================
@@ -868,9 +1338,17 @@ shutdown    Attempt to gracefully shutdown the service
 reload      Attempt to gracefully restart the service
 ==========  ===============================================
 
-A graceful shutdown or reload will finish any current requests before 
-completely stopping the old service.  There is also a special case of 
+A graceful shutdown or reload will finish any current requests before
+completely stopping the old service.  There is also a special case of
 `swift-init all <command>`, which will run the command for all swift services.
+
+In cases where there are multiple configs for a service, a specific config
+can be managed with ``swift-init <service>.<config> <command>``.
+For example, when a separate replication network is used, there might be
+`/etc/swift/object-server/public.conf` for the object server and
+`/etc/swift/object-server/replication.conf` for the replication services.
+In this case, the replication services could be restarted with
+``swift-init object-server.replication restart``.
 
 --------------
 Object Auditor
@@ -883,6 +1361,13 @@ an extra, less rate limited sweep to check for these specific files. You can
 run this command as follows:
 `swift-object-auditor /path/to/object-server/config/file.conf once -z 1000`
 "-z" means to only check for zero-byte files at 1000 files per second.
+
+At times it is useful to be able to run the object auditor on a specific
+device or set of devices.  You can run the object-auditor as follows:
+swift-object-auditor /path/to/object-server/config/file.conf once --devices=sda,sdb
+
+This will run the object auditor on only the sda and sdb devices. This param
+accepts a comma separated list of values.
 
 -----------------
 Object Replicator
@@ -903,7 +1388,7 @@ Swift Orphans
 
 Swift Orphans are processes left over after a reload of a Swift server.
 
-For example, when upgrading a proxy server you would probaby finish
+For example, when upgrading a proxy server you would probably finish
 with a `swift-init proxy-server reload` or `/etc/init.d/swift-proxy
 reload`. This kills the parent proxy server process and leaves the
 child processes running to finish processing whatever requests they
@@ -981,3 +1466,11 @@ following:
 
 See :ref:`custom-logger-hooks-label` for sample use cases.
 
+------------------------
+Securing OpenStack Swift
+------------------------
+
+Please refer to the security guides at:
+
+* http://docs.openstack.org/sec/
+* http://docs.openstack.org/security-guide/content/object-storage.html

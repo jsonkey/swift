@@ -1,4 +1,4 @@
-# Copyright (c) 2010-2012 OpenStack, LLC.
+# Copyright (c) 2010-2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,16 +14,28 @@
 # limitations under the License.
 
 from eventlet import sleep, Timeout
+from eventlet.green import httplib, socket
 import json
-from paste.deploy import loadapp
+import six
+from six.moves import range
+from six.moves import urllib
 import struct
-from sys import exc_info
-from urllib import quote
+from sys import exc_info, exit
 import zlib
+from swift import gettext_ as _
+from time import gmtime, strftime, time
 from zlib import compressobj
 
-from swift.common.http import HTTP_NOT_FOUND
+from swift.common.exceptions import ClientException
+from swift.common.http import HTTP_NOT_FOUND, HTTP_MULTIPLE_CHOICES
 from swift.common.swob import Request
+from swift.common.utils import quote
+from swift.common.wsgi import loadapp, pipeline_property
+
+if six.PY3:
+    from eventlet.green.urllib import request as urllib2
+else:
+    from eventlet.green import urllib2
 
 
 class UnexpectedResponse(Exception):
@@ -35,7 +47,7 @@ class UnexpectedResponse(Exception):
     """
 
     def __init__(self, message, resp):
-        super(UnexpectedResponse, self).__init__(self, message)
+        super(UnexpectedResponse, self).__init__(message)
         self.resp = resp
 
 
@@ -49,13 +61,25 @@ class CompressingFileReader(object):
 
     :param file_obj: File object to wrap.
     :param compresslevel:  Compression level, defaults to 9.
+    :param chunk_size:  Size of chunks read when iterating using object,
+                        defaults to 4096.
     """
 
-    def __init__(self, file_obj, compresslevel=9):
+    def __init__(self, file_obj, compresslevel=9, chunk_size=4096):
         self._f = file_obj
+        self.compresslevel = compresslevel
+        self.chunk_size = chunk_size
+        self.set_initial_state()
+
+    def set_initial_state(self):
+        """
+        Sets the object to the state needed for the first read.
+        """
+
+        self._f.seek(0)
         self._compressor = compressobj(
-            compresslevel, zlib.DEFLATED, -zlib.MAX_WBITS, zlib.DEF_MEM_LEVEL,
-            0)
+            self.compresslevel, zlib.DEFLATED, -zlib.MAX_WBITS,
+            zlib.DEF_MEM_LEVEL, 0)
         self.done = False
         self.first = True
         self.crc32 = 0
@@ -74,15 +98,15 @@ class CompressingFileReader(object):
             return ''
         x = self._f.read(*a, **kw)
         if x:
-            self.crc32 = zlib.crc32(x, self.crc32) & 0xffffffffL
+            self.crc32 = zlib.crc32(x, self.crc32) & 0xffffffff
             self.total_size += len(x)
             compressed = self._compressor.compress(x)
             if not compressed:
                 compressed = self._compressor.flush(zlib.Z_SYNC_FLUSH)
         else:
             compressed = self._compressor.flush(zlib.Z_FINISH)
-            crc32 = struct.pack("<L", self.crc32 & 0xffffffffL)
-            size = struct.pack("<L", self.total_size & 0xffffffffL)
+            crc32 = struct.pack("<L", self.crc32 & 0xffffffff)
+            size = struct.pack("<L", self.total_size & 0xffffffff)
             footer = crc32 + size
             compressed += footer
             self.done = True
@@ -96,10 +120,15 @@ class CompressingFileReader(object):
         return self
 
     def next(self):
-        chunk = self.read()
+        chunk = self.read(self.chunk_size)
         if chunk:
             return chunk
         raise StopIteration
+
+    def seek(self, offset, whence=0):
+        if not (offset == 0 and whence == 0):
+            raise NotImplementedError('Seek implemented on offset 0 only')
+        self.set_initial_state()
 
 
 class InternalClient(object):
@@ -114,15 +143,22 @@ class InternalClient(object):
                           gives up.
     """
 
-    def __init__(self, conf_path, user_agent, request_tries):
-        self.app = loadapp('config:' + conf_path)
+    def __init__(self, conf_path, user_agent, request_tries,
+                 allow_modify_pipeline=False):
+        self.app = loadapp(conf_path,
+                           allow_modify_pipeline=allow_modify_pipeline)
         self.user_agent = user_agent
         self.request_tries = request_tries
 
+    get_object_ring = pipeline_property('get_object_ring')
+    container_ring = pipeline_property('container_ring')
+    account_ring = pipeline_property('account_ring')
+    auto_create_account_prefix = pipeline_property(
+        'auto_create_account_prefix', default='.')
+
     def make_request(
             self, method, path, headers, acceptable_statuses, body_file=None):
-        """
-        Makes a request to Swift with retries.
+        """Makes a request to Swift with retries.
 
         :param method: HTTP method of request.
         :param path: Path of request.
@@ -131,7 +167,7 @@ class InternalClient(object):
         :param body_file: Body file to be passed along with request,
                           defaults to None.
 
-        :returns : Response object on success.
+        :returns: Response object on success.
 
         :raises UnexpectedResponse: Exception raised when make_request() fails
                                     to get a response with an acceptable status
@@ -142,7 +178,7 @@ class InternalClient(object):
         headers = dict(headers)
         headers['user-agent'] = self.user_agent
         resp = exc_type = exc_value = exc_traceback = None
-        for attempt in xrange(self.request_tries):
+        for attempt in range(self.request_tries):
             req = Request.blank(
                 path, environ={'REQUEST_METHOD': method}, headers=headers)
             if body_file is not None:
@@ -156,16 +192,19 @@ class InternalClient(object):
                     return resp
             except (Exception, Timeout):
                 exc_type, exc_value, exc_traceback = exc_info()
-            sleep(2 ** (attempt + 1))
+            # sleep only between tries, not after each one
+            if attempt < self.request_tries - 1:
+                sleep(2 ** (attempt + 1))
         if resp:
             raise UnexpectedResponse(
-                _('Unexpected response: %s' % (resp.status,)), resp)
+                _('Unexpected response: %s') % resp.status, resp)
         if exc_type:
             # To make pep8 tool happy, in place of raise t, v, tb:
-            raise exc_type(*exc_value.args), None, exc_traceback
+            six.reraise(exc_type(*exc_value.args), None, exc_traceback)
 
     def _get_metadata(
-            self, path, metadata_prefix='', acceptable_statuses=(2,)):
+            self, path, metadata_prefix='', acceptable_statuses=(2,),
+            headers=None):
         """
         Gets metadata by doing a HEAD on a path and using the metadata_prefix
         to get values from the headers returned.
@@ -176,8 +215,10 @@ class InternalClient(object):
                                 keys in the dict returned.  Defaults to ''.
         :param acceptable_statuses: List of status for valid responses,
                                     defaults to (2,).
+        :param headers: extra headers to send
 
-        :returns : A dict of metadata with metadata_prefix stripped from keys.
+        :returns: A dict of metadata with metadata_prefix stripped from keys.
+                  Keys will be lowercase.
 
         :raises UnexpectedResponse: Exception raised when requests fail
                                     to get a response with an acceptable status
@@ -185,14 +226,13 @@ class InternalClient(object):
                            unexpected way.
         """
 
-        resp = self.make_request('HEAD', path, {}, acceptable_statuses)
-        if resp.status_int // 100 != 2:
-            return {}
+        headers = headers or {}
+        resp = self.make_request('HEAD', path, headers, acceptable_statuses)
         metadata_prefix = metadata_prefix.lower()
         metadata = {}
-        for k, v in resp.headers.iteritems():
+        for k, v in resp.headers.items():
             if k.lower().startswith(metadata_prefix):
-                metadata[k[len(metadata_prefix):]] = v
+                metadata[k[len(metadata_prefix):].lower()] = v
         return metadata
 
     def _iter_items(
@@ -214,16 +254,15 @@ class InternalClient(object):
         :raises Exception: Exception is raised when code fails in an
                            unexpected way.
         """
-        if isinstance(marker, unicode):
-            marker = marker.encode('utf8')
-        if isinstance(end_marker, unicode):
-            end_marker = end_marker.encode('utf8')
+
         while True:
             resp = self.make_request(
                 'GET', '%s?format=json&marker=%s&end_marker=%s' %
                 (path, quote(marker), quote(end_marker)),
                 {}, acceptable_statuses)
-            if resp.status_int != 200:
+            if not resp.status_int == 200:
+                if resp.status_int >= HTTP_MULTIPLE_CHOICES:
+                    ''.join(resp.app_iter)
                 break
             data = json.loads(resp.body)
             if not data:
@@ -244,15 +283,6 @@ class InternalClient(object):
         :raises ValueError: Is raised if obj is specified and container is
                             not.
         """
-
-        if isinstance(account, unicode):
-            account = account.encode('utf-8')
-
-        if isinstance(container, unicode):
-            container = container.encode('utf-8')
-
-        if isinstance(obj, unicode):
-            obj = obj.encode('utf-8')
 
         path = '/v1/%s' % quote(account)
         if container:
@@ -286,7 +316,7 @@ class InternalClient(object):
         """
 
         headers = {}
-        for k, v in metadata.iteritems():
+        for k, v in metadata.items():
             if k.lower().startswith(metadata_prefix):
                 headers[k] = v
             else:
@@ -334,13 +364,14 @@ class InternalClient(object):
 
         path = self.make_path(account)
         resp = self.make_request('HEAD', path, {}, acceptable_statuses)
+        if not resp.status_int // 100 == 2:
+            return (0, 0)
         return (int(resp.headers.get('x-account-container-count', 0)),
                 int(resp.headers.get('x-account-object-count', 0)))
 
     def get_account_metadata(
             self, account, metadata_prefix='', acceptable_statuses=(2,)):
-        """
-        Gets account metadata.
+        """Gets account metadata.
 
         :param account: Account on which to get the metadata.
         :param metadata_prefix: Used to filter values from the headers
@@ -349,7 +380,7 @@ class InternalClient(object):
         :param acceptable_statuses: List of status for valid responses,
                                     defaults to (2,).
 
-        :returns : Returns dict of account metadata.
+        :returns: Returns dict of account metadata.  Keys will be lowercase.
 
         :raises UnexpectedResponse: Exception raised when requests fail
                                     to get a response with an acceptable status
@@ -390,23 +421,22 @@ class InternalClient(object):
     # container methods
 
     def container_exists(self, account, container):
-        """
-        Checks to see if a container exists.
+        """Checks to see if a container exists.
 
         :param account: The container's account.
         :param container: Container to check.
-
-        :returns : True if container exists, false otherwise.
 
         :raises UnexpectedResponse: Exception raised when requests fail
                                     to get a response with an acceptable status
         :raises Exception: Exception is raised when code fails in an
                            unexpected way.
+
+        :returns: True if container exists, false otherwise.
         """
 
         path = self.make_path(account, container)
         resp = self.make_request('HEAD', path, {}, (2, HTTP_NOT_FOUND))
-        return resp.status_int != HTTP_NOT_FOUND
+        return not resp.status_int == HTTP_NOT_FOUND
 
     def create_container(
             self, account, container, headers=None, acceptable_statuses=(2,)):
@@ -451,8 +481,7 @@ class InternalClient(object):
     def get_container_metadata(
             self, account, container, metadata_prefix='',
             acceptable_statuses=(2,)):
-        """
-        Gets container metadata.
+        """Gets container metadata.
 
         :param account: The container's account.
         :param container: Container to get metadata on.
@@ -462,7 +491,7 @@ class InternalClient(object):
         :param acceptable_statuses: List of status for valid responses,
                                     defaults to (2,).
 
-        :returns : Returns dict of container metadata.
+        :returns: Returns dict of container metadata.  Keys will be lowercase.
 
         :raises UnexpectedResponse: Exception raised when requests fail
                                     to get a response with an acceptable status
@@ -528,7 +557,8 @@ class InternalClient(object):
 
     def delete_object(
             self, account, container, obj,
-            acceptable_statuses=(2, HTTP_NOT_FOUND)):
+            acceptable_statuses=(2, HTTP_NOT_FOUND),
+            headers=None):
         """
         Deletes an object.
 
@@ -537,6 +567,7 @@ class InternalClient(object):
         :param obj: The object.
         :param acceptable_statuses: List of status for valid responses,
                                     defaults to (2, HTTP_NOT_FOUND).
+        :param headers: extra headers to send with request
 
         :raises UnexpectedResponse: Exception raised when requests fail
                                     to get a response with an acceptable status
@@ -545,13 +576,12 @@ class InternalClient(object):
         """
 
         path = self.make_path(account, container, obj)
-        self.make_request('DELETE', path, {}, acceptable_statuses)
+        self.make_request('DELETE', path, (headers or {}), acceptable_statuses)
 
     def get_object_metadata(
             self, account, container, obj, metadata_prefix='',
-            acceptable_statuses=(2,)):
-        """
-        Gets object metadata.
+            acceptable_statuses=(2,), headers=None):
+        """Gets object metadata.
 
         :param account: The object's account.
         :param container: The object's container.
@@ -561,8 +591,9 @@ class InternalClient(object):
                                 keys in the dict returned.  Defaults to ''.
         :param acceptable_statuses: List of status for valid responses,
                                     defaults to (2,).
+        :param headers: extra headers to send with request
 
-        :returns : Dict of object metadata.
+        :returns: Dict of object metadata.
 
         :raises UnexpectedResponse: Exception raised when requests fail
                                     to get a response with an acceptable status
@@ -571,7 +602,19 @@ class InternalClient(object):
         """
 
         path = self.make_path(account, container, obj)
-        return self._get_metadata(path, metadata_prefix, acceptable_statuses)
+        return self._get_metadata(path, metadata_prefix, acceptable_statuses,
+                                  headers=headers)
+
+    def get_object(self, account, container, obj, headers,
+                   acceptable_statuses=(2,)):
+        """
+        Returns a 3-tuple (status, headers, iterator of object body)
+        """
+
+        headers = headers or {}
+        path = self.make_path(account, container, obj)
+        resp = self.make_request('GET', path, headers, acceptable_statuses)
+        return (resp.status_int, resp.headers, resp.app_iter)
 
     def iter_object_lines(
             self, account, container, obj, headers=None,
@@ -584,7 +627,7 @@ class InternalClient(object):
 
         :param account: The object's account.
         :param container: The object's container.
-        :param objec_namet: The object.
+        :param obj: The object.
         :param acceptable_statuses: List of status for valid responses,
                                     defaults to (2,).
 
@@ -596,8 +639,9 @@ class InternalClient(object):
 
         headers = headers or {}
         path = self.make_path(account, container, obj)
-
         resp = self.make_request('GET', path, headers, acceptable_statuses)
+        if not resp.status_int // 100 == 2:
+            return
 
         last_part = ''
         compressed = obj.endswith('.gz')
@@ -662,6 +706,168 @@ class InternalClient(object):
         """
 
         headers = dict(headers or {})
-        headers['Transfer-Encoding'] = 'chunked'
+        if 'Content-Length' not in headers:
+            headers['Transfer-Encoding'] = 'chunked'
         path = self.make_path(account, container, obj)
         self.make_request('PUT', path, headers, (2,), fobj)
+
+
+def get_auth(url, user, key, auth_version='1.0', **kwargs):
+    if auth_version != '1.0':
+        exit('ERROR: swiftclient missing, only auth v1.0 supported')
+    req = urllib2.Request(url)
+    req.add_header('X-Auth-User', user)
+    req.add_header('X-Auth-Key', key)
+    conn = urllib2.urlopen(req)
+    headers = conn.info()
+    return (
+        headers.getheader('X-Storage-Url'),
+        headers.getheader('X-Auth-Token'))
+
+
+class SimpleClient(object):
+    """
+    Simple client that is used in bin/swift-dispersion-* and container sync
+    """
+    def __init__(self, url=None, token=None, starting_backoff=1,
+                 max_backoff=5, retries=5):
+        self.url = url
+        self.token = token
+        self.attempts = 0  # needed in swif-dispersion-populate
+        self.starting_backoff = starting_backoff
+        self.max_backoff = max_backoff
+        self.retries = retries
+
+    def base_request(self, method, container=None, name=None, prefix=None,
+                     headers=None, proxy=None, contents=None,
+                     full_listing=None, logger=None, additional_info=None,
+                     timeout=None, marker=None):
+        # Common request method
+        trans_start = time()
+        url = self.url
+
+        if full_listing:
+            info, body_data = self.base_request(
+                method, container, name, prefix, headers, proxy,
+                timeout=timeout, marker=marker)
+            listing = body_data
+            while listing:
+                marker = listing[-1]['name']
+                info, listing = self.base_request(
+                    method, container, name, prefix, headers, proxy,
+                    timeout=timeout, marker=marker)
+                if listing:
+                    body_data.extend(listing)
+            return [info, body_data]
+
+        if headers is None:
+            headers = {}
+
+        if self.token:
+            headers['X-Auth-Token'] = self.token
+
+        if container:
+            url = '%s/%s' % (url.rstrip('/'), quote(container))
+
+        if name:
+            url = '%s/%s' % (url.rstrip('/'), quote(name))
+        else:
+            url += '?format=json'
+            if prefix:
+                url += '&prefix=%s' % prefix
+
+            if marker:
+                url += '&marker=%s' % quote(marker)
+
+        req = urllib2.Request(url, headers=headers, data=contents)
+        if proxy:
+            proxy = urllib.parse.urlparse(proxy)
+            req.set_proxy(proxy.netloc, proxy.scheme)
+        req.get_method = lambda: method
+        conn = urllib2.urlopen(req, timeout=timeout)
+        body = conn.read()
+        info = conn.info()
+        try:
+            body_data = json.loads(body)
+        except ValueError:
+            body_data = None
+        trans_stop = time()
+        if logger:
+            sent_content_length = 0
+            for n, v in headers.items():
+                nl = n.lower()
+                if nl == 'content-length':
+                    try:
+                        sent_content_length = int(v)
+                        break
+                    except ValueError:
+                        pass
+            logger.debug("-> " + " ".join(
+                quote(str(x) if x else "-", ":/")
+                for x in (
+                    strftime('%Y-%m-%dT%H:%M:%S', gmtime(trans_stop)),
+                    method,
+                    url,
+                    conn.getcode(),
+                    sent_content_length,
+                    info['content-length'],
+                    trans_start,
+                    trans_stop,
+                    trans_stop - trans_start,
+                    additional_info
+                )))
+        return [info, body_data]
+
+    def retry_request(self, method, **kwargs):
+        retries = kwargs.pop('retries', self.retries)
+        self.attempts = 0
+        backoff = self.starting_backoff
+        while self.attempts <= retries:
+            self.attempts += 1
+            try:
+                return self.base_request(method, **kwargs)
+            except (socket.error, httplib.HTTPException, urllib2.URLError) \
+                    as err:
+                if self.attempts > retries:
+                    if isinstance(err, urllib2.HTTPError):
+                        raise ClientException('Raise too many retries',
+                                              http_status=err.getcode())
+                    else:
+                        raise
+            sleep(backoff)
+            backoff = min(backoff * 2, self.max_backoff)
+
+    def get_account(self, *args, **kwargs):
+        # Used in swift-dispersion-populate
+        return self.retry_request('GET', **kwargs)
+
+    def put_container(self, container, **kwargs):
+        # Used in swift-dispersion-populate
+        return self.retry_request('PUT', container=container, **kwargs)
+
+    def get_container(self, container, **kwargs):
+        # Used in swift-dispersion-populate
+        return self.retry_request('GET', container=container, **kwargs)
+
+    def put_object(self, container, name, contents, **kwargs):
+        # Used in swift-dispersion-populate
+        return self.retry_request('PUT', container=container, name=name,
+                                  contents=contents.read(), **kwargs)
+
+
+def head_object(url, **kwargs):
+    """For usage with container sync """
+    client = SimpleClient(url=url)
+    return client.retry_request('HEAD', **kwargs)
+
+
+def put_object(url, **kwargs):
+    """For usage with container sync """
+    client = SimpleClient(url=url)
+    client.retry_request('PUT', **kwargs)
+
+
+def delete_object(url, **kwargs):
+    """For usage with container sync """
+    client = SimpleClient(url=url)
+    client.retry_request('DELETE', **kwargs)

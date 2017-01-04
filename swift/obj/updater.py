@@ -1,4 +1,4 @@
-# Copyright (c) 2010-2012 OpenStack, LLC.
+# Copyright (c) 2010-2012 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,32 +13,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import cPickle as pickle
+import six.moves.cPickle as pickle
 import os
 import signal
 import sys
 import time
+from swift import gettext_ as _
 from random import random
 
-from eventlet import patcher, Timeout
+from eventlet import spawn, patcher, Timeout
 
 from swift.common.bufferedhttp import http_connect
 from swift.common.exceptions import ConnectionTimeout
 from swift.common.ring import Ring
 from swift.common.utils import get_logger, renamer, write_pickle, \
-    dump_recon_cache, config_true_value
+    dump_recon_cache, config_true_value, ismount
 from swift.common.daemon import Daemon
-from swift.obj.server import ASYNCDIR
-from swift.common.http import is_success, HTTP_NOT_FOUND, \
-    HTTP_INTERNAL_SERVER_ERROR
+from swift.common.header_key_dict import HeaderKeyDict
+from swift.common.storage_policy import split_policy_string, PolicyError
+from swift.obj.diskfile import get_tmp_dir, ASYNCDIR_BASE
+from swift.common.http import is_success, HTTP_INTERNAL_SERVER_ERROR
 
 
 class ObjectUpdater(Daemon):
     """Update object information in container listings."""
 
-    def __init__(self, conf):
+    def __init__(self, conf, logger=None):
         self.conf = conf
-        self.logger = get_logger(conf, log_route='object-updater')
+        self.logger = logger or get_logger(conf, log_route='object-updater')
         self.devices = conf.get('devices', '/srv/node')
         self.mount_check = config_true_value(conf.get('mount_check', 'true'))
         self.swift_dir = conf.get('swift_dir', '/etc/swift')
@@ -46,13 +48,22 @@ class ObjectUpdater(Daemon):
         self.container_ring = None
         self.concurrency = int(conf.get('concurrency', 1))
         self.slowdown = float(conf.get('slowdown', 0.01))
-        self.node_timeout = int(conf.get('node_timeout', 10))
+        self.node_timeout = float(conf.get('node_timeout', 10))
         self.conn_timeout = float(conf.get('conn_timeout', 0.5))
         self.successes = 0
         self.failures = 0
         self.recon_cache_path = conf.get('recon_cache_path',
                                          '/var/cache/swift')
         self.rcache = os.path.join(self.recon_cache_path, 'object.recon')
+
+    def _listdir(self, path):
+        try:
+            return os.listdir(path)
+        except OSError as e:
+            self.logger.error(_('ERROR: Unable to access %(path)s: '
+                                '%(error)s') %
+                              {'path': path, 'error': e})
+            return []
 
     def get_container_ring(self):
         """Get the container ring.  Load it, if it hasn't been yet."""
@@ -69,11 +80,11 @@ class ObjectUpdater(Daemon):
             pids = []
             # read from container ring to ensure it's fresh
             self.get_container_ring().get_nodes('')
-            for device in os.listdir(self.devices):
-                if self.mount_check and not \
-                        os.path.ismount(os.path.join(self.devices, device)):
+            for device in self._listdir(self.devices):
+                if self.mount_check and \
+                        not ismount(os.path.join(self.devices, device)):
                     self.logger.increment('errors')
-                    self.logger.warn(
+                    self.logger.warning(
                         _('Skipping %s as it is not mounted'), device)
                     continue
                 while len(pids) >= self.concurrency:
@@ -83,7 +94,8 @@ class ObjectUpdater(Daemon):
                     pids.append(pid)
                 else:
                     signal.signal(signal.SIGTERM, signal.SIG_DFL)
-                    patcher.monkey_patch(all=False, socket=True)
+                    patcher.monkey_patch(all=False, socket=True, select=True,
+                                         thread=True)
                     self.successes = 0
                     self.failures = 0
                     forkbegin = time.time()
@@ -107,16 +119,16 @@ class ObjectUpdater(Daemon):
                 time.sleep(self.interval - elapsed)
 
     def run_once(self, *args, **kwargs):
-        """Run the updater once"""
+        """Run the updater once."""
         self.logger.info(_('Begin object update single threaded sweep'))
         begin = time.time()
         self.successes = 0
         self.failures = 0
-        for device in os.listdir(self.devices):
+        for device in self._listdir(self.devices):
             if self.mount_check and \
-                    not os.path.ismount(os.path.join(self.devices, device)):
+                    not ismount(os.path.join(self.devices, device)):
                 self.logger.increment('errors')
-                self.logger.warn(
+                self.logger.warning(
                     _('Skipping %s as it is not mounted'), device)
                 continue
             self.object_sweep(os.path.join(self.devices, device))
@@ -136,45 +148,61 @@ class ObjectUpdater(Daemon):
         :param device: path to device
         """
         start_time = time.time()
-        async_pending = os.path.join(device, ASYNCDIR)
-        if not os.path.isdir(async_pending):
-            return
-        for prefix in os.listdir(async_pending):
-            prefix_path = os.path.join(async_pending, prefix)
-            if not os.path.isdir(prefix_path):
+        # loop through async pending dirs for all policies
+        for asyncdir in self._listdir(device):
+            # we only care about directories
+            async_pending = os.path.join(device, asyncdir)
+            if not os.path.isdir(async_pending):
                 continue
-            last_obj_hash = None
-            for update in sorted(os.listdir(prefix_path), reverse=True):
-                update_path = os.path.join(prefix_path, update)
-                if not os.path.isfile(update_path):
-                    continue
-                try:
-                    obj_hash, timestamp = update.split('-')
-                except ValueError:
-                    self.logger.increment('errors')
-                    self.logger.error(
-                        _('ERROR async pending file with unexpected name %s')
-                        % (update_path))
-                    continue
-                if obj_hash == last_obj_hash:
-                    self.logger.increment("unlinks")
-                    os.unlink(update_path)
-                else:
-                    self.process_object_update(update_path, device)
-                    last_obj_hash = obj_hash
-                time.sleep(self.slowdown)
+            if not asyncdir.startswith(ASYNCDIR_BASE):
+                # skip stuff like "accounts", "containers", etc.
+                continue
             try:
-                os.rmdir(prefix_path)
-            except OSError:
-                pass
-        self.logger.timing_since('timing', start_time)
+                base, policy = split_policy_string(asyncdir)
+            except PolicyError as e:
+                self.logger.warning(_('Directory %(directory)r does not map '
+                                      'to a valid policy (%(error)s)') % {
+                                    'directory': asyncdir, 'error': e})
+                continue
+            for prefix in self._listdir(async_pending):
+                prefix_path = os.path.join(async_pending, prefix)
+                if not os.path.isdir(prefix_path):
+                    continue
+                last_obj_hash = None
+                for update in sorted(self._listdir(prefix_path), reverse=True):
+                    update_path = os.path.join(prefix_path, update)
+                    if not os.path.isfile(update_path):
+                        continue
+                    try:
+                        obj_hash, timestamp = update.split('-')
+                    except ValueError:
+                        self.logger.increment('errors')
+                        self.logger.error(
+                            _('ERROR async pending file with unexpected '
+                              'name %s')
+                            % (update_path))
+                        continue
+                    if obj_hash == last_obj_hash:
+                        self.logger.increment("unlinks")
+                        os.unlink(update_path)
+                    else:
+                        self.process_object_update(update_path, device,
+                                                   policy)
+                        last_obj_hash = obj_hash
+                    time.sleep(self.slowdown)
+                try:
+                    os.rmdir(prefix_path)
+                except OSError:
+                    pass
+            self.logger.timing_since('timing', start_time)
 
-    def process_object_update(self, update_path, device):
+    def process_object_update(self, update_path, device, policy):
         """
         Process the object information to be updated and update.
 
         :param update_path: path to pickled object update file
         :param device: path to device
+        :param policy: storage policy of object update
         """
         try:
             update = pickle.load(open(update_path, 'rb'))
@@ -182,61 +210,74 @@ class ObjectUpdater(Daemon):
             self.logger.exception(
                 _('ERROR Pickle problem, quarantining %s'), update_path)
             self.logger.increment('quarantines')
-            renamer(update_path, os.path.join(
-                    device, 'quarantined', 'objects',
-                    os.path.basename(update_path)))
+            target_path = os.path.join(device, 'quarantined', 'objects',
+                                       os.path.basename(update_path))
+            renamer(update_path, target_path, fsync=False)
             return
         successes = update.get('successes', [])
         part, nodes = self.get_container_ring().get_nodes(
             update['account'], update['container'])
         obj = '/%s/%s/%s' % \
               (update['account'], update['container'], update['obj'])
+        headers_out = HeaderKeyDict(update['headers'])
+        headers_out['user-agent'] = 'object-updater %s' % os.getpid()
+        headers_out.setdefault('X-Backend-Storage-Policy-Index',
+                               str(int(policy)))
+        events = [spawn(self.object_update,
+                        node, part, update['op'], obj, headers_out)
+                  for node in nodes if node['id'] not in successes]
         success = True
         new_successes = False
-        for node in nodes:
-            if node['id'] not in successes:
-                status = self.object_update(node, part, update['op'], obj,
-                                            update['headers'])
-                if not is_success(status) and status != HTTP_NOT_FOUND:
-                    success = False
-                else:
-                    successes.append(node['id'])
-                    new_successes = True
+        for event in events:
+            event_success, node_id = event.wait()
+            if event_success is True:
+                successes.append(node_id)
+                new_successes = True
+            else:
+                success = False
         if success:
             self.successes += 1
             self.logger.increment('successes')
-            self.logger.debug(_('Update sent for %(obj)s %(path)s'),
+            self.logger.debug('Update sent for %(obj)s %(path)s',
                               {'obj': obj, 'path': update_path})
             self.logger.increment("unlinks")
             os.unlink(update_path)
         else:
             self.failures += 1
             self.logger.increment('failures')
-            self.logger.debug(_('Update failed for %(obj)s %(path)s'),
+            self.logger.debug('Update failed for %(obj)s %(path)s',
                               {'obj': obj, 'path': update_path})
             if new_successes:
                 update['successes'] = successes
-                write_pickle(update, update_path, os.path.join(device, 'tmp'))
+                write_pickle(update, update_path, os.path.join(
+                    device, get_tmp_dir(policy)))
 
-    def object_update(self, node, part, op, obj, headers):
+    def object_update(self, node, part, op, obj, headers_out):
         """
         Perform the object update to the container
 
         :param node: node dictionary from the container ring
         :param part: partition that holds the container
-        :param op: operation performed (ex: 'POST' or 'DELETE')
+        :param op: operation performed (ex: 'PUT' or 'DELETE')
         :param obj: object name being updated
-        :param headers: headers to send with the update
+        :param headers_out: headers to send with the update
         """
         try:
             with ConnectionTimeout(self.conn_timeout):
                 conn = http_connect(node['ip'], node['port'], node['device'],
-                                    part, op, obj, headers)
+                                    part, op, obj, headers_out)
             with Timeout(self.node_timeout):
                 resp = conn.getresponse()
                 resp.read()
-                return resp.status
+                success = is_success(resp.status)
+                if not success:
+                    self.logger.debug(
+                        _('Error code %(status)d is returned from remote '
+                          'server %(ip)s: %(port)s / %(device)s'),
+                        {'status': resp.status, 'ip': node['ip'],
+                         'port': node['port'], 'device': node['device']})
+                return (success, node['id'])
         except (Exception, Timeout):
             self.logger.exception(_('ERROR with remote server '
                                     '%(ip)s:%(port)s/%(device)s'), node)
-        return HTTP_INTERNAL_SERVER_ERROR
+        return HTTP_INTERNAL_SERVER_ERROR, node['id']
